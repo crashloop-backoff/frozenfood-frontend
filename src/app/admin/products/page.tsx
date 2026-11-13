@@ -39,6 +39,9 @@ const productFormSchema = z.object({
   hargaEceran: z.coerce
     .number({ invalid_type_error: 'Harga eceran harus berupa angka' })
     .gt(0, 'Harga eceran harus lebih dari 0'),
+  hargaBeli: z.coerce
+    .number({ invalid_type_error: 'Harga beli harus berupa angka' })
+    .min(0, 'Harga beli minimal 0'),
   berat: z.coerce
     .number({ invalid_type_error: 'Berat harus berupa angka' })
     .gt(0, 'Berat produk harus lebih dari 0 gram'),
@@ -149,6 +152,7 @@ export default function AdminProductsPage() {
     register,
     handleSubmit,
     reset,
+    watch,
     formState: { errors, isSubmitting },
   } = useForm<ProductFormValues>({
     resolver: zodResolver(productFormSchema),
@@ -157,12 +161,18 @@ export default function AdminProductsPage() {
       kategori: '',
       deskripsiProduk: '',
       hargaEceran: 0,
+      hargaBeli: 0,
       berat: 500,
       volume: 0,
       gambar: '',
       isActive: true,
     },
   });
+
+  const watchedHargaEceran = watch('hargaEceran');
+  const watchedHargaBeli = watch('hargaBeli');
+  const keuntunganForm =
+    (Number(watchedHargaEceran) || 0) - (Number(watchedHargaBeli) || 0);
 
   const {
     register: registerBatch,
@@ -202,6 +212,7 @@ export default function AdminProductsPage() {
       kategori: 'Frozen Food',
       deskripsiProduk: '',
       hargaEceran: 25000,
+      hargaBeli: 0,
       berat: 500,
       volume: 0,
       gambar: '',
@@ -220,6 +231,7 @@ export default function AdminProductsPage() {
       kategori: product.kategori || '',
       deskripsiProduk: product.deskripsiProduk || '',
       hargaEceran: product.hargaEceran,
+      hargaBeli: product.hargaBeli ?? 0,
       berat: toGramInput(product.berat),
       volume: product.volume ?? 0,
       gambar: product.gambar || '',
@@ -285,6 +297,7 @@ export default function AdminProductsPage() {
       kategori: values.kategori.trim(),
       deskripsiProduk: values.deskripsiProduk?.trim() || undefined,
       hargaEceran: Number(values.hargaEceran),
+      hargaBeli: Number(values.hargaBeli) || 0,
       berat: toKgPayload(Number(values.berat)),
       volume:
         values.volume !== undefined && !Number.isNaN(Number(values.volume))
@@ -813,6 +826,41 @@ export default function AdminProductsPage() {
 
                 <div>
                   <label className="block text-xs font-semibold text-[#171725] mb-1.5">
+                    Harga Beli (Rp, &ge; 0) *
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="any"
+                    {...register('hargaBeli')}
+                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
+                  />
+                  {errors.hargaBeli && (
+                    <p className="mt-1 text-xs text-[#E5484D]">
+                      {errors.hargaBeli.message}
+                    </p>
+                  )}
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
+                    Keuntungan (Rp)
+                  </label>
+                  <input
+                    type="text"
+                    readOnly
+                    disabled
+                    value={formatRupiah(keuntunganForm)}
+                    className={`w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm bg-[#F1F3F8] font-semibold focus:outline-none ${
+                      keuntunganForm < 0 ? 'text-red-600' : 'text-emerald-600'
+                    }`}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
                     Berat (gram, &gt; 0) *
                   </label>
                   <input
@@ -985,6 +1033,8 @@ export default function AdminProductsPage() {
                     <th className="py-3.5 px-4 font-bold">Produk</th>
                     <th className="py-3.5 px-4 font-bold">Kategori</th>
                     <th className="py-3.5 px-4 font-bold">Harga Eceran</th>
+                    <th className="py-3.5 px-4 font-bold">Harga Beli</th>
+                    <th className="py-3.5 px-4 font-bold">Keuntungan</th>
                     <th className="py-3.5 px-4 font-bold">Berat & Volume</th>
                     <th className="py-3.5 px-4 font-bold">Stok Online</th>
                     <th className="py-3.5 px-4 font-bold">Status</th>
@@ -995,6 +1045,11 @@ export default function AdminProductsPage() {
                   {filteredProducts.map((product) => {
                     const stock = getProductStock(product);
                     const isActive = product.isActive ?? true;
+                    const nilaiKeuntungan =
+                      product.keuntungan !== undefined &&
+                      product.keuntungan !== null
+                        ? product.keuntungan
+                        : (product.hargaEceran || 0) - (product.hargaBeli || 0);
 
                     return (
                       <tr
@@ -1041,6 +1096,20 @@ export default function AdminProductsPage() {
 
                         <td className="py-3.5 px-4 font-extrabold text-[#4737FF]">
                           {formatRupiah(product.hargaEceran)}
+                        </td>
+
+                        <td className="py-3.5 px-4 font-semibold text-[#171725]">
+                          {formatRupiah(product.hargaBeli || 0)}
+                        </td>
+
+                        <td
+                          className={`py-3.5 px-4 ${
+                            nilaiKeuntungan < 0
+                              ? 'text-red-600 font-semibold'
+                              : 'text-emerald-600 font-semibold'
+                          }`}
+                        >
+                          {formatRupiah(nilaiKeuntungan)}
                         </td>
 
                         <td className="py-3.5 px-4 text-[#5E5E6A] font-medium">
