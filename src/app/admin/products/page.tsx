@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
@@ -20,6 +20,8 @@ import {
   AlertTriangle,
   Layers,
   Calendar,
+  Bell,
+  Tag,
 } from 'lucide-react';
 import { api } from '@/lib/axios';
 import { formatRupiah, getErrorMessage, getProductStock } from '@/lib/utils';
@@ -29,6 +31,7 @@ import {
   ProductBatchRequest,
   ProductBatchUpdateRequest,
   ProductBatchResponse,
+  ExpiryAlertResponse,
 } from '@/types/api';
 import AdminSidebar from '@/components/admin/admin-sidebar';
 
@@ -71,12 +74,6 @@ const batchFormSchema = z.object({
 
 type BatchFormValues = z.infer<typeof batchFormSchema>;
 
-function getDefaultFutureDate(daysAhead = 30): string {
-  const d = new Date();
-  d.setDate(d.getDate() + daysAhead);
-  return d.toISOString().split('T')[0];
-}
-
 function toGramInput(rawBerat: number | undefined | null): number {
   const val = Number(rawBerat || 0);
   if (val <= 0) return 500;
@@ -94,7 +91,27 @@ function formatWeightDisplay(rawBerat: number | undefined | null): string {
 }
 
 export default function AdminProductsPage() {
+  // State waktu client-side (diisi di useEffect agar bebas error prerender Next.js 16)
+  const [nowMs, setNowMs] = useState<number | null>(null);
+  const [minExpDate, setMinExpDate] = useState<string>('');
+
+  useEffect(() => {
+    const now = new Date();
+    setNowMs(now.getTime());
+
+    const tomorrow = new Date(now.getTime());
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    setMinExpDate(tomorrow.toISOString().split('T')[0]);
+  }, []);
+
+  // State Pencarian & Filter Katalog Produk
   const [searchKeyword, setSearchKeyword] = useState<string>('');
+  const [selectedCategoryFilter, setSelectedCategoryFilter] =
+    useState<string>('ALL');
+  const [productStatusFilter, setProductStatusFilter] = useState<
+    'ALL' | 'AVAILABLE' | 'PROMO' | 'OUT_OF_STOCK'
+  >('ALL');
+
   const [isFormOpen, setIsFormOpen] = useState<boolean>(false);
   const [editingProduct, setEditingProduct] =
     useState<ProductCatalogResponse | null>(null);
@@ -102,6 +119,11 @@ export default function AdminProductsPage() {
     useState<ProductCatalogResponse | null>(null);
   const [isDeleting, setIsDeleting] = useState<boolean>(false);
 
+  // State Pencarian & Filter Batch Inventori FEFO
+  const [batchSearchKeyword, setBatchSearchKeyword] = useState<string>('');
+  const [batchStatusFilter, setBatchStatusFilter] = useState<
+    'ALL' | 'NEAR_EXPIRY' | 'PROMO' | 'AVAILABLE' | 'EMPTY'
+  >('ALL');
   const [isBatchFormOpen, setIsBatchFormOpen] = useState<boolean>(false);
   const [editingBatch, setEditingBatch] =
     useState<ProductBatchResponse | null>(null);
@@ -110,6 +132,16 @@ export default function AdminProductsPage() {
   const [isDeletingBatch, setIsDeletingBatch] = useState<boolean>(false);
   const [selectedBatchFilterProduct, setSelectedBatchFilterProduct] =
     useState<string>('');
+
+  const [showResolvedAlerts, setShowResolvedAlerts] = useState<boolean>(false);
+  const [resolvingAlertId, setResolvingAlertId] = useState<string | null>(null);
+
+  const [tieringTargetProduct, setTieringTargetProduct] =
+    useState<ProductCatalogResponse | null>(null);
+  const [tierMinQty, setTierMinQty] = useState<string>('10');
+  const [tierMaxQty, setTierMaxQty] = useState<string>('49');
+  const [tierHargaUnit, setTierHargaUnit] = useState<string>('');
+  const [isSavingTier, setIsSavingTier] = useState<boolean>(false);
 
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
@@ -143,6 +175,23 @@ export default function AdminProductsPage() {
       const res = await api.get<ProductBatchResponse[]>(
         '/api/inventory/batches',
         { params }
+      );
+      return res.data;
+    },
+  });
+
+  const {
+    data: expiryAlerts = [],
+    isLoading: isLoadingAlerts,
+    refetch: refetchAlerts,
+  } = useQuery<ExpiryAlertResponse[]>({
+    queryKey: ['admin-expiry-alerts', showResolvedAlerts],
+    queryFn: async () => {
+      const res = await api.get<ExpiryAlertResponse[]>(
+        '/api/inventory/alerts',
+        {
+          params: { unresolvedOnly: !showResolvedAlerts },
+        }
       );
       return res.data;
     },
@@ -190,17 +239,99 @@ export default function AdminProductsPage() {
     },
   });
 
+  // Daftar kategori unik untuk dropdown filter produk
+  const categoryOptions = useMemo(() => {
+    const set = new Set<string>();
+    products.forEach((p) => {
+      if (p.kategori && p.kategori.trim()) {
+        set.add(p.kategori.trim());
+      }
+    });
+    return Array.from(set).sort();
+  }, [products]);
+
+  // Filter & Pencarian Katalog Produk
   const filteredProducts = useMemo(() => {
     const kw = searchKeyword.trim().toLowerCase();
-    if (!kw) return products;
-    return products.filter(
-      (p) =>
+
+    return products.filter((p) => {
+      if (
+        selectedCategoryFilter !== 'ALL' &&
+        (p.kategori || '').toLowerCase() !==
+          selectedCategoryFilter.toLowerCase()
+      ) {
+        return false;
+      }
+
+      const stock = getProductStock(p);
+      const hasPromoOrTier =
+        Boolean(p.isClearance) ||
+        Boolean(p.tieringPrices && p.tieringPrices.length > 0);
+
+      if (productStatusFilter === 'AVAILABLE' && stock <= 0) return false;
+      if (productStatusFilter === 'PROMO' && !hasPromoOrTier) return false;
+      if (productStatusFilter === 'OUT_OF_STOCK' && stock > 0) return false;
+
+      if (!kw) return true;
+
+      return (
         p.namaProduk.toLowerCase().includes(kw) ||
         p.idProduk.toLowerCase().includes(kw) ||
         (p.kategori && p.kategori.toLowerCase().includes(kw)) ||
         (p.deskripsiProduk && p.deskripsiProduk.toLowerCase().includes(kw))
-    );
-  }, [products, searchKeyword]);
+      );
+    });
+  }, [products, searchKeyword, selectedCategoryFilter, productStatusFilter]);
+
+  // Filter & Pencarian Batch Inventori FEFO (menggunakan state nowMs dari useEffect)
+  const filteredBatches = useMemo(() => {
+    const kw = batchSearchKeyword.trim().toLowerCase();
+
+    return batches.filter((b) => {
+      const expMs = Date.parse(b.tanggalExp);
+      const diffDays =
+        nowMs !== null && !Number.isNaN(expMs)
+          ? Math.ceil((expMs - nowMs) / (1000 * 60 * 60 * 24))
+          : 999;
+
+      const isExpired = nowMs !== null && diffDays < 0;
+      const isNearExpiry = nowMs !== null && diffDays >= 0 && diffDays <= 30;
+      const hasPromo =
+        (b.diskon !== null && b.diskon !== undefined && Number(b.diskon) > 0) ||
+        (b.hargaOverride !== null &&
+          b.hargaOverride !== undefined &&
+          Number(b.hargaOverride) > 0);
+
+      if (batchStatusFilter === 'NEAR_EXPIRY' && !isNearExpiry) return false;
+      if (batchStatusFilter === 'PROMO' && !hasPromo) return false;
+      if (
+        batchStatusFilter === 'AVAILABLE' &&
+        (b.stokOnline <= 0 || isExpired)
+      ) {
+        return false;
+      }
+      if (batchStatusFilter === 'EMPTY' && b.stokOnline > 0 && !isExpired) {
+        return false;
+      }
+
+      if (!kw) return true;
+
+      return (
+        String(b.idProdBatch || '')
+          .toLowerCase()
+          .includes(kw) ||
+        String(b.namaProduk || '')
+          .toLowerCase()
+          .includes(kw) ||
+        String(b.productId || '')
+          .toLowerCase()
+          .includes(kw) ||
+        String(b.tanggalExp || '')
+          .toLowerCase()
+          .includes(kw)
+      );
+    });
+  }, [batches, batchSearchKeyword, batchStatusFilter, nowMs]);
 
   const handleOpenCreate = () => {
     setActionError(null);
@@ -396,7 +527,7 @@ export default function AdminProductsPage() {
       }
       setIsBatchFormOpen(false);
       setEditingBatch(null);
-      await Promise.all([refetch(), refetchBatches()]);
+      await Promise.all([refetch(), refetchBatches(), refetchAlerts()]);
     } catch (err) {
       setActionError(
         getErrorMessage(
@@ -423,7 +554,7 @@ export default function AdminProductsPage() {
         `Batch "${deleteBatchTarget.idProdBatch}" (${deleteBatchTarget.namaProduk}) berhasil dihapus.`
       );
       setDeleteBatchTarget(null);
-      await Promise.all([refetch(), refetchBatches()]);
+      await Promise.all([refetch(), refetchBatches(), refetchAlerts()]);
     } catch (err) {
       setActionError(
         getErrorMessage(err, 'Gagal menghapus batch stok FEFO.')
@@ -460,6 +591,114 @@ export default function AdminProductsPage() {
     }
   };
 
+  const handleResolveAlert = async (alertItem: ExpiryAlertResponse) => {
+    setActionError(null);
+    setActionSuccess(null);
+    setResolvingAlertId(alertItem.idAlert);
+    try {
+      await api.patch(`/api/inventory/alerts/${alertItem.idAlert}/resolve`);
+      setActionSuccess(
+        `Peringatan kedaluwarsa untuk batch "${alertItem.idProdBatch}" telah ditandai selesai.`
+      );
+      await refetchAlerts();
+    } catch (err) {
+      setActionError(
+        getErrorMessage(err, 'Gagal menandai peringatan kedaluwarsa selesai.')
+      );
+    } finally {
+      setResolvingAlertId(null);
+    }
+  };
+
+  const handleEditBatchFromAlert = (alertItem: ExpiryAlertResponse) => {
+    const matchedBatch = batches.find(
+      (b) => b.idProdBatch === alertItem.idProdBatch
+    );
+    if (matchedBatch) {
+      handleOpenEditBatch(matchedBatch);
+    } else {
+      handleOpenEditBatch({
+        idProdBatch: alertItem.idProdBatch,
+        productId: alertItem.idProduk,
+        namaProduk: alertItem.namaProduk,
+        stokAwal: alertItem.stokOnline,
+        stokOnline: alertItem.stokOnline,
+        tanggalExp: alertItem.tanggalExp,
+        hargaOverride: alertItem.hargaOverride,
+        diskon: alertItem.diskon,
+      });
+    }
+  };
+
+  const handleOpenTieringModal = (product: ProductCatalogResponse) => {
+    setActionError(null);
+    setActionSuccess(null);
+    setTieringTargetProduct(product);
+    setTierMinQty('10');
+    setTierMaxQty('49');
+    setTierHargaUnit(
+      String(Math.round((product.hargaEceran || 25000) * 0.9))
+    );
+  };
+
+  const handleAddTieringRule = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!tieringTargetProduct) return;
+    setActionError(null);
+    setActionSuccess(null);
+    setIsSavingTier(true);
+    try {
+      const res = await api.post<ProductCatalogResponse>(
+        `/api/products/${tieringTargetProduct.idProduk}/tiering`,
+        {
+          minQty: Number(tierMinQty),
+          maxQty: Number(tierMaxQty),
+          hargaPerUnit: Number(tierHargaUnit),
+        }
+      );
+      setTieringTargetProduct(res.data);
+      setActionSuccess(
+        `Aturan harga grosir (Tiering) untuk "${tieringTargetProduct.namaProduk}" berhasil ditambahkan.`
+      );
+      await refetch();
+    } catch (err) {
+      setActionError(
+        getErrorMessage(err, 'Gagal menambahkan aturan Tiering Price.')
+      );
+    } finally {
+      setIsSavingTier(false);
+    }
+  };
+
+  const handleDeleteTieringRule = async (idTiering: string) => {
+    if (!tieringTargetProduct) return;
+    setActionError(null);
+    setActionSuccess(null);
+    try {
+      await api.delete(`/api/products/tiering/${idTiering}`);
+      const updatedRes = await api.get<ProductCatalogResponse>(
+        `/api/products/${tieringTargetProduct.idProduk}`
+      );
+      setTieringTargetProduct(updatedRes.data);
+      setActionSuccess('Aturan Tiering Price berhasil dihapus.');
+      await refetch();
+    } catch (err) {
+      setActionError(
+        getErrorMessage(err, 'Gagal menghapus aturan Tiering Price.')
+      );
+    }
+  };
+
+  const hasActiveProductFilter =
+    Boolean(searchKeyword.trim()) ||
+    selectedCategoryFilter !== 'ALL' ||
+    productStatusFilter !== 'ALL';
+
+  const hasActiveBatchFilter =
+    Boolean(batchSearchKeyword.trim()) ||
+    batchStatusFilter !== 'ALL' ||
+    Boolean(selectedBatchFilterProduct);
+
   return (
     <div className="lezzat-shell">
       <AdminSidebar />
@@ -482,6 +721,7 @@ export default function AdminProductsPage() {
               onClick={() => {
                 refetch();
                 refetchBatches();
+                refetchAlerts();
               }}
               className="inline-flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-white border border-[#E6E8F0] hover:bg-[#F1F3F8] text-[#171725] text-xs font-semibold transition-colors cursor-pointer"
             >
@@ -513,13 +753,158 @@ export default function AdminProductsPage() {
         <div className="mb-6 flex items-start gap-2.5 rounded-2xl bg-[#E7EFFF] border border-[#D1CDFF] p-3.5 text-xs text-[#171725]">
           <Info className="w-4 h-4 text-[#4737FF] shrink-0 mt-0.5" />
           <span>
-            <strong>Integrasi Master Produk & FEFO:</strong> Katalog terhubung ke{' '}
-            <code className="font-mono text-[#4737FF]">/api/products</code> dan
-            rotasi stok berdasarkan tanggal kedaluwarsa terdekat (
-            <em>First Expired, First Out</em>) terhubung ke{' '}
-            <code className="font-mono text-[#4737FF]">/api/inventory/batches</code>.
+            <strong>Integrasi Master Produk, FEFO Deals & Expiry Alert:</strong>{' '}
+            Batch kedaluwarsa <strong>≤ 30 hari</strong> otomatis masuk{' '}
+            <strong>FEFO Flash Deal (-20%)</strong> dan batch{' '}
+            <strong>≤ 7 hari</strong> otomatis masuk{' '}
+            <strong>Clearance (-50%)</strong>. Anda tetap dapat mengatur harga
+            override / diskon tiap batch maupun aturan harga grosir (Tiering).
           </span>
         </div>
+
+        {/* Panel Notifikasi Expiry Alert (GET /api/inventory/alerts) */}
+        <section className="mb-6 ff-card p-5 bg-white border border-[#F75C03]/35">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3.5 mb-4 border-b border-[#E6E8F0]">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-[#F75C03]/15 text-[#F75C03] flex items-center justify-center shrink-0">
+                <Bell className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h2 className="font-heading text-base font-extrabold text-[#171725]">
+                    Peringatan Kedaluwarsa & Otomasi Flash Deals (Expiry Alert)
+                  </h2>
+                  <span className="px-2.5 py-0.5 rounded-full bg-[#F75C03] text-white text-[10px] font-extrabold">
+                    {expiryAlerts.filter((a) => !a.isResolved).length} Aktif
+                  </span>
+                </div>
+                <p className="text-xs text-[#77788A]">
+                  Dipindai otomatis oleh <code>ExpiryAlertScheduler</code> (H-30
+                  FEFO Deal 20% &amp; H-7 Clearance 50% •{' '}
+                  <code>GET /api/inventory/alerts</code>)
+                </p>
+              </div>
+            </div>
+
+            <label className="inline-flex items-center gap-2 text-xs font-semibold text-[#5E5E6A] cursor-pointer self-start sm:self-center">
+              <input
+                type="checkbox"
+                checked={showResolvedAlerts}
+                onChange={(e) => setShowResolvedAlerts(e.target.checked)}
+                className="w-3.5 h-3.5 rounded accent-[#4737FF]"
+              />
+              <span>Tampilkan yang sudah selesai</span>
+            </label>
+          </div>
+
+          {isLoadingAlerts ? (
+            <div className="h-16 rounded-2xl bg-[#F1F3F8] animate-pulse" />
+          ) : expiryAlerts.length === 0 ? (
+            <div className="rounded-2xl bg-[#159A68]/10 border border-[#159A68]/25 p-4 flex items-center gap-3 text-xs text-[#159A68]">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              <span className="font-semibold">
+                Tidak ada peringatan kedaluwarsa yang belum ditangani saat ini.
+                Semua stok batch dalam kondisi terpantau.
+              </span>
+            </div>
+          ) : (
+            <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
+              {expiryAlerts.map((alertItem) => {
+                const isClearanceAlert = alertItem.pesan
+                  .toUpperCase()
+                  .includes('CLEARANCE');
+                return (
+                  <div
+                    key={alertItem.idAlert}
+                    className={`rounded-2xl p-3.5 border flex flex-col lg:flex-row lg:items-center justify-between gap-3 ${
+                      alertItem.isResolved
+                        ? 'bg-[#F8FAFF] border-[#E6E8F0] opacity-70'
+                        : isClearanceAlert
+                          ? 'bg-[#E5484D]/5 border-[#E5484D]/30'
+                          : 'bg-[#F75C03]/5 border-[#F75C03]/30'
+                    }`}
+                  >
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase ${
+                            isClearanceAlert
+                              ? 'bg-[#E5484D] text-white'
+                              : 'bg-[#F75C03] text-white'
+                          }`}
+                        >
+                          {isClearanceAlert
+                            ? 'CLEARANCE H-7 (50%)'
+                            : 'DARURAT H-30 (FEFO DEAL)'}
+                        </span>
+                        <span className="font-mono text-xs font-bold text-[#171725]">
+                          Batch: {alertItem.idProdBatch}
+                        </span>
+                        <span className="text-xs text-[#5E5E6A]">
+                          • Stok Online:{' '}
+                          <strong className="text-[#171725]">
+                            {alertItem.stokOnline} unit
+                          </strong>
+                        </span>
+                        <span className="text-xs text-[#5E5E6A]">
+                          • Exp:{' '}
+                          <strong className="text-[#E5484D]">
+                            {alertItem.tanggalExp}
+                          </strong>
+                        </span>
+                        {alertItem.diskon != null && alertItem.diskon > 0 && (
+                          <span className="px-2 py-0.5 rounded-full bg-[#159A68]/15 text-[#159A68] text-[10px] font-extrabold">
+                            Diskon Aktif: {alertItem.diskon}%
+                          </span>
+                        )}
+                        {alertItem.hargaOverride != null &&
+                          alertItem.hargaOverride > 0 && (
+                            <span className="px-2 py-0.5 rounded-full bg-[#4737FF]/15 text-[#4737FF] text-[10px] font-extrabold">
+                              Override: {formatRupiah(alertItem.hargaOverride)}
+                            </span>
+                          )}
+                      </div>
+                      <p className="text-xs font-semibold text-[#171725]">
+                        {alertItem.pesan}
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleEditBatchFromAlert(alertItem)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-[#4737FF]/30 bg-white hover:bg-[#E7EFFF] text-[#4737FF] text-[11px] font-bold cursor-pointer"
+                      >
+                        <Pencil className="w-3 h-3" />
+                        <span>Atur Harga / Diskon Batch</span>
+                      </button>
+
+                      {!alertItem.isResolved ? (
+                        <button
+                          type="button"
+                          disabled={resolvingAlertId === alertItem.idAlert}
+                          onClick={() => handleResolveAlert(alertItem)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#159A68] hover:opacity-90 disabled:opacity-50 text-white text-[11px] font-bold cursor-pointer"
+                        >
+                          <CheckCircle2 className="w-3 h-3" />
+                          <span>
+                            {resolvingAlertId === alertItem.idAlert
+                              ? 'Menyimpan...'
+                              : 'Tandai Selesai'}
+                          </span>
+                        </button>
+                      ) : (
+                        <span className="px-2.5 py-1 rounded-xl bg-[#159A68]/15 text-[#159A68] text-[10px] font-extrabold">
+                          Selesai Ditangani
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
 
         {/* Alert Error / Sukses */}
         {actionError && (
@@ -675,7 +1060,7 @@ export default function AdminProductsPage() {
                   </label>
                   <input
                     type="date"
-                    min={editingBatch ? undefined : getDefaultFutureDate(1)}
+                    min={editingBatch ? undefined : minExpDate || undefined}
                     {...registerBatch('tanggalExp')}
                     className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
                   />
@@ -958,30 +1343,104 @@ export default function AdminProductsPage() {
 
         {/* Tabel Daftar Katalog Produk */}
         <section className="ff-card p-6 bg-white mb-8">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 mb-4 border-b border-[#E6E8F0]">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-[#E7EFFF] text-[#4737FF] flex items-center justify-center">
-                <Package className="w-5 h-5" />
+          <div className="flex flex-col space-y-4 pb-4 mb-4 border-b border-[#E6E8F0]">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-[#E7EFFF] text-[#4737FF] flex items-center justify-center">
+                  <Package className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="font-heading text-base font-extrabold text-[#171725]">
+                    Daftar Katalog Produk
+                  </h2>
+                  <p className="text-xs text-[#77788A]">
+                    Menampilkan <strong>{filteredProducts.length}</strong> dari{' '}
+                    {products.length} produk
+                  </p>
+                </div>
               </div>
-              <div>
-                <h2 className="font-heading text-base font-extrabold text-[#171725]">
-                  Daftar Katalog Produk
-                </h2>
-                <p className="text-xs text-[#77788A]">
-                  Total {filteredProducts.length} produk ditampilkan
-                </p>
+
+              {/* Bar Pencarian & Dropdown Kategori Produk */}
+              <div className="flex flex-wrap items-center gap-2.5">
+                <div className="relative w-full sm:w-72">
+                  <Search className="w-4 h-4 text-[#77788A] absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="search"
+                    value={searchKeyword}
+                    onChange={(e) => setSearchKeyword(e.target.value)}
+                    placeholder="Cari kode (NGT-001), nama, kategori..."
+                    className="w-full rounded-xl border border-[#E6E8F0] bg-[#F8FAFF] focus:bg-white pl-10 pr-8 py-2 text-xs text-[#171725] focus:border-[#4737FF] focus:outline-none"
+                  />
+                  {searchKeyword && (
+                    <button
+                      type="button"
+                      onClick={() => setSearchKeyword('')}
+                      aria-label="Bersihkan pencarian produk"
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#77788A] hover:text-[#171725] cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                <select
+                  value={selectedCategoryFilter}
+                  onChange={(e) => setSelectedCategoryFilter(e.target.value)}
+                  aria-label="Filter kategori produk"
+                  className="rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725] bg-[#F8FAFF] focus:bg-white focus:border-[#4737FF] focus:outline-none"
+                >
+                  <option value="ALL">Semua Kategori</option>
+                  {categoryOptions.map((cat) => (
+                    <option key={cat} value={cat}>
+                      {cat}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
 
-            <div className="relative w-full sm:w-72">
-              <Search className="w-4 h-4 text-[#77788A] absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                type="search"
-                value={searchKeyword}
-                onChange={(e) => setSearchKeyword(e.target.value)}
-                placeholder="Cari kode, nama, atau kategori..."
-                className="w-full rounded-xl border border-[#E6E8F0] bg-[#F8FAFF] focus:bg-white pl-10 pr-3.5 py-2 text-xs text-[#171725] focus:border-[#4737FF] focus:outline-none"
-              />
+            {/* Filter Pil Status Produk */}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(
+                  [
+                    { key: 'ALL', label: 'Semua Produk' },
+                    { key: 'AVAILABLE', label: 'Stok Tersedia' },
+                    { key: 'PROMO', label: 'Sedang Promo / Tiering' },
+                    { key: 'OUT_OF_STOCK', label: 'Stok Habis (0)' },
+                  ] as const
+                ).map((item) => {
+                  const isActive = productStatusFilter === item.key;
+                  return (
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={() => setProductStatusFilter(item.key)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
+                        isActive
+                          ? 'bg-[#4737FF] text-white'
+                          : 'bg-[#F8FAFF] border border-[#E6E8F0] text-[#5E5E6A] hover:border-[#4737FF]'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {hasActiveProductFilter && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchKeyword('');
+                    setSelectedCategoryFilter('ALL');
+                    setProductStatusFilter('ALL');
+                  }}
+                  className="text-xs font-bold text-[#4737FF] hover:underline cursor-pointer"
+                >
+                  Reset Filter Produk
+                </button>
+              )}
             </div>
           </div>
 
@@ -1019,7 +1478,7 @@ export default function AdminProductsPage() {
                 Produk tidak ditemukan
               </p>
               <p className="text-xs text-[#77788A]">
-                Belum ada produk atau tidak ada yang cocok dengan kata kunci
+                Belum ada produk atau tidak ada yang cocok dengan filter
                 pencarian.
               </p>
             </div>
@@ -1094,8 +1553,25 @@ export default function AdminProductsPage() {
                           </span>
                         </td>
 
-                        <td className="py-3.5 px-4 font-extrabold text-[#4737FF]">
-                          {formatRupiah(product.hargaEceran)}
+                        <td className="py-3.5 px-4">
+                          <div className="font-extrabold text-[#4737FF]">
+                            {formatRupiah(product.hargaEceran)}
+                          </div>
+                          {product.isClearance && product.hargaClearance && (
+                            <div className="mt-0.5 inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#F75C03]/15 text-[#D93800] text-[10px] font-extrabold">
+                              <span>
+                                Deal: {formatRupiah(product.hargaClearance)} (-
+                                {product.diskonPersen}%)
+                              </span>
+                            </div>
+                          )}
+                          {product.tieringPrices &&
+                            product.tieringPrices.length > 0 && (
+                              <div className="mt-0.5 text-[10px] font-bold text-[#159A68]">
+                                {product.tieringPrices.length} Aturan Grosir
+                                (Tiering)
+                              </div>
+                            )}
                         </td>
 
                         <td className="py-3.5 px-4 font-semibold text-[#171725]">
@@ -1143,6 +1619,14 @@ export default function AdminProductsPage() {
                           <div className="inline-flex items-center gap-1.5">
                             <button
                               type="button"
+                              onClick={() => handleOpenTieringModal(product)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl border border-[#4737FF]/30 bg-[#E7EFFF] hover:bg-[#D1CDFF] text-[#4737FF] text-[11px] font-bold cursor-pointer"
+                            >
+                              <Tag className="w-3 h-3" />
+                              <span>Tiering</span>
+                            </button>
+                            <button
+                              type="button"
                               onClick={() =>
                                 handleOpenBatchForm(product.idProduk)
                               }
@@ -1180,36 +1664,107 @@ export default function AdminProductsPage() {
 
         {/* Tabel Daftar Batch Inventori FEFO */}
         <section className="ff-card p-6 bg-white">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 mb-4 border-b border-[#E6E8F0]">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-[#F75C03]/15 text-[#F75C03] flex items-center justify-center">
-                <Layers className="w-5 h-5" />
+          <div className="flex flex-col space-y-4 pb-4 mb-4 border-b border-[#E6E8F0]">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-[#F75C03]/15 text-[#F75C03] flex items-center justify-center">
+                  <Layers className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="font-heading text-base font-extrabold text-[#171725]">
+                    Daftar Batch Inventori FEFO (First Expired, First Out)
+                  </h2>
+                  <p className="text-xs text-[#77788A]">
+                    Menampilkan <strong>{filteredBatches.length}</strong> dari{' '}
+                    {batches.length} batch FEFO
+                  </p>
+                </div>
               </div>
-              <div>
-                <h2 className="font-heading text-base font-extrabold text-[#171725]">
-                  Daftar Batch Inventori FEFO (First Expired, First Out)
-                </h2>
-                <p className="text-xs text-[#77788A]">
-                  Diurutkan otomatis berdasarkan tanggal kedaluwarsa terdekat (
-                  <code>GET /api/inventory/batches</code>)
-                </p>
+
+              {/* Bar Pencarian Batch FEFO & Filter Produk */}
+              <div className="flex flex-wrap items-center gap-2.5">
+                <div className="relative w-full sm:w-72">
+                  <Search className="w-4 h-4 text-[#77788A] absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="search"
+                    value={batchSearchKeyword}
+                    onChange={(e) => setBatchSearchKeyword(e.target.value)}
+                    placeholder="Cari kode batch, produk, tgl exp..."
+                    className="w-full rounded-xl border border-[#E6E8F0] bg-[#F8FAFF] focus:bg-white pl-10 pr-8 py-2 text-xs text-[#171725] focus:border-[#4737FF] focus:outline-none"
+                  />
+                  {batchSearchKeyword && (
+                    <button
+                      type="button"
+                      onClick={() => setBatchSearchKeyword('')}
+                      aria-label="Bersihkan pencarian batch"
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#77788A] hover:text-[#171725] cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                <select
+                  value={selectedBatchFilterProduct}
+                  onChange={(e) =>
+                    setSelectedBatchFilterProduct(e.target.value)
+                  }
+                  aria-label="Filter batch berdasarkan produk"
+                  className="rounded-xl border border-[#E6E8F0] px-3.5 py-2 text-xs text-[#171725] bg-[#F8FAFF] focus:bg-white focus:border-[#4737FF] focus:outline-none"
+                >
+                  <option value="">Semua Produk ({batches.length} batch)</option>
+                  {products.map((p) => (
+                    <option key={p.idProduk} value={p.idProduk}>
+                      [{p.idProduk}] {p.namaProduk}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
-              <select
-                value={selectedBatchFilterProduct}
-                onChange={(e) => setSelectedBatchFilterProduct(e.target.value)}
-                aria-label="Filter batch berdasarkan produk"
-                className="rounded-xl border border-[#E6E8F0] px-3.5 py-2 text-xs text-[#171725] bg-[#F8FAFF] focus:bg-white focus:border-[#4737FF] focus:outline-none"
-              >
-                <option value="">Semua Produk ({batches.length} batch)</option>
-                {products.map((p) => (
-                  <option key={p.idProduk} value={p.idProduk}>
-                    [{p.idProduk}] {p.namaProduk}
-                  </option>
-                ))}
-              </select>
+            {/* Filter Pil Status Batch FEFO */}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(
+                  [
+                    { key: 'ALL', label: 'Semua Batch' },
+                    { key: 'NEAR_EXPIRY', label: 'Prioritas FEFO (≤ 30 Hari)' },
+                    { key: 'PROMO', label: 'Sedang Diskon / Override' },
+                    { key: 'AVAILABLE', label: 'Stok Aktif (> 0)' },
+                    { key: 'EMPTY', label: 'Habis / Kedaluwarsa' },
+                  ] as const
+                ).map((tab) => {
+                  const isActive = batchStatusFilter === tab.key;
+                  return (
+                    <button
+                      key={tab.key}
+                      type="button"
+                      onClick={() => setBatchStatusFilter(tab.key)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
+                        isActive
+                          ? 'bg-[#F75C03] text-white'
+                          : 'bg-[#F8FAFF] border border-[#E6E8F0] text-[#5E5E6A] hover:border-[#F75C03]'
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {hasActiveBatchFilter && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBatchSearchKeyword('');
+                    setBatchStatusFilter('ALL');
+                    setSelectedBatchFilterProduct('');
+                  }}
+                  className="text-xs font-bold text-[#F75C03] hover:underline cursor-pointer"
+                >
+                  Reset Filter Batch
+                </button>
+              )}
             </div>
           </div>
 
@@ -1235,151 +1790,167 @@ export default function AdminProductsPage() {
             </div>
           )}
 
-          {!isLoadingBatches && !isErrorBatches && batches.length === 0 && (
-            <div className="rounded-2xl bg-[#F8FAFF] p-8 text-center my-2">
-              <Calendar className="w-8 h-8 text-[#ACA5FF] mx-auto mb-2" />
-              <p className="text-sm font-bold text-[#171725] mb-1">
-                Belum Ada Batch Stok FEFO
-              </p>
-              <p className="text-xs text-[#77788A] mb-4">
-                Tambahkan batch stok baru agar produk memiliki stok online dan
-                dapat dipesan oleh pelanggan.
-              </p>
-              <button
-                type="button"
-                onClick={() =>
-                  handleOpenBatchForm(selectedBatchFilterProduct || undefined)
-                }
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[#F75C03] text-white text-xs font-bold hover:bg-[#D94800] cursor-pointer"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Tambah Batch Pertama</span>
-              </button>
-            </div>
-          )}
+          {!isLoadingBatches &&
+            !isErrorBatches &&
+            filteredBatches.length === 0 && (
+              <div className="rounded-2xl bg-[#F8FAFF] p-8 text-center my-2">
+                <Calendar className="w-8 h-8 text-[#ACA5FF] mx-auto mb-2" />
+                <p className="text-sm font-bold text-[#171725] mb-1">
+                  {batches.length === 0
+                    ? 'Belum Ada Batch Stok FEFO'
+                    : 'Batch FEFO Tidak Ditemukan'}
+                </p>
+                <p className="text-xs text-[#77788A] mb-4">
+                  {batches.length === 0
+                    ? 'Tambahkan batch stok baru agar produk memiliki stok online dan dapat dipesan oleh pelanggan.'
+                    : `Tidak ada batch yang cocok dengan pencarian "${batchSearchKeyword}".`}
+                </p>
+                {batches.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleOpenBatchForm(
+                        selectedBatchFilterProduct || undefined
+                      )
+                    }
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[#F75C03] text-white text-xs font-bold hover:bg-[#D94800] cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Tambah Batch Pertama</span>
+                  </button>
+                )}
+              </div>
+            )}
 
-          {!isLoadingBatches && !isErrorBatches && batches.length > 0 && (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs border-collapse">
-                <thead>
-                  <tr className="border-b border-[#E6E8F0] text-[#77788A] uppercase tracking-wider text-[11px]">
-                    <th className="py-3.5 px-4 font-bold">Kode Batch</th>
-                    <th className="py-3.5 px-4 font-bold">Produk</th>
-                    <th className="py-3.5 px-4 font-bold">Stok Awal</th>
-                    <th className="py-3.5 px-4 font-bold">Sisa Stok Online</th>
-                    <th className="py-3.5 px-4 font-bold">
-                      Tanggal Kedaluwarsa
-                    </th>
-                    <th className="py-3.5 px-4 font-bold">
-                      Harga Khusus / Diskon
-                    </th>
-                    <th className="py-3.5 px-4 font-bold text-right">
-                      Aksi Batch
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#E6E8F0]">
-                  {batches.map((b) => {
-                    const expDate = new Date(b.tanggalExp);
-                    const now = new Date();
-                    const diffDays = Math.ceil(
-                      (expDate.getTime() - now.getTime()) /
-                        (1000 * 60 * 60 * 24)
-                    );
-                    const isExpired = diffDays < 0;
-                    const isNearExpiry = diffDays >= 0 && diffDays <= 30;
+          {!isLoadingBatches &&
+            !isErrorBatches &&
+            filteredBatches.length > 0 && (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr className="border-b border-[#E6E8F0] text-[#77788A] uppercase tracking-wider text-[11px]">
+                      <th className="py-3.5 px-4 font-bold">Kode Batch</th>
+                      <th className="py-3.5 px-4 font-bold">Produk</th>
+                      <th className="py-3.5 px-4 font-bold">Stok Awal</th>
+                      <th className="py-3.5 px-4 font-bold">
+                        Sisa Stok Online
+                      </th>
+                      <th className="py-3.5 px-4 font-bold">
+                        Tanggal Kedaluwarsa
+                      </th>
+                      <th className="py-3.5 px-4 font-bold">
+                        Harga Khusus / Diskon
+                      </th>
+                      <th className="py-3.5 px-4 font-bold text-right">
+                        Aksi Batch
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#E6E8F0]">
+                    {filteredBatches.map((b) => {
+                      const expMs = Date.parse(b.tanggalExp);
+                      const diffDays =
+                        nowMs !== null && !Number.isNaN(expMs)
+                          ? Math.ceil((expMs - nowMs) / (1000 * 60 * 60 * 24))
+                          : null;
+                      const isExpired = diffDays !== null && diffDays < 0;
+                      const isNearExpiry =
+                        diffDays !== null && diffDays >= 0 && diffDays <= 30;
 
-                    return (
-                      <tr
-                        key={b.idProdBatch}
-                        className="hover:bg-[#F8FAFF] transition-colors"
-                      >
-                        <td className="py-3.5 px-4 font-mono font-bold text-[#171725]">
-                          {b.idProdBatch}
-                        </td>
-                        <td className="py-3.5 px-4">
-                          <span className="font-bold text-[#171725]">
-                            {b.namaProduk}
-                          </span>
-                          <span className="ml-1.5 font-mono text-[10px] text-[#77788A]">
-                            ({b.productId})
-                          </span>
-                        </td>
-                        <td className="py-3.5 px-4 text-[#5E5E6A]">
-                          {b.stokAwal} unit
-                        </td>
-                        <td className="py-3.5 px-4">
-                          <span
-                            className={`font-bold ${
-                              b.stokOnline > 0
-                                ? 'text-[#159A68]'
-                                : 'text-[#E5484D]'
-                            }`}
-                          >
-                            {b.stokOnline} unit
-                          </span>
-                        </td>
-                        <td className="py-3.5 px-4">
-                          <div className="flex items-center gap-2">
-                            <span className="font-semibold text-[#171725]">
-                              {b.tanggalExp}
+                      return (
+                        <tr
+                          key={b.idProdBatch}
+                          className="hover:bg-[#F8FAFF] transition-colors"
+                        >
+                          <td className="py-3.5 px-4 font-mono font-bold text-[#171725]">
+                            {b.idProdBatch}
+                          </td>
+                          <td className="py-3.5 px-4">
+                            <span className="font-bold text-[#171725]">
+                              {b.namaProduk}
                             </span>
-                            {isExpired ? (
-                              <span className="px-2 py-0.5 rounded-full bg-[#E5484D]/15 text-[#E5484D] text-[10px] font-extrabold">
-                                Kedaluwarsa
+                            <span className="ml-1.5 font-mono text-[10px] text-[#77788A]">
+                              ({b.productId})
+                            </span>
+                          </td>
+                          <td className="py-3.5 px-4 text-[#5E5E6A]">
+                            {b.stokAwal} unit
+                          </td>
+                          <td className="py-3.5 px-4">
+                            <span
+                              className={`font-bold ${
+                                b.stokOnline > 0
+                                  ? 'text-[#159A68]'
+                                  : 'text-[#E5484D]'
+                              }`}
+                            >
+                              {b.stokOnline} unit
+                            </span>
+                          </td>
+                          <td className="py-3.5 px-4">
+                            <div className="flex items-center gap-2">
+                              <span className="font-semibold text-[#171725]">
+                                {b.tanggalExp}
                               </span>
-                            ) : isNearExpiry ? (
-                              <span className="px-2 py-0.5 rounded-full bg-[#D97706]/15 text-[#D97706] text-[10px] font-extrabold">
-                                Prioritas FEFO ({diffDays} hr)
+                              {diffDays !== null &&
+                                (isExpired ? (
+                                  <span className="px-2 py-0.5 rounded-full bg-[#E5484D]/15 text-[#E5484D] text-[10px] font-extrabold">
+                                    Kedaluwarsa
+                                  </span>
+                                ) : isNearExpiry ? (
+                                  <span className="px-2 py-0.5 rounded-full bg-[#D97706]/15 text-[#D97706] text-[10px] font-extrabold">
+                                    Prioritas FEFO ({diffDays} hr)
+                                  </span>
+                                ) : (
+                                  <span className="px-2 py-0.5 rounded-full bg-[#159A68]/15 text-[#159A68] text-[10px] font-extrabold">
+                                    Aman ({diffDays} hr)
+                                  </span>
+                                ))}
+                            </div>
+                          </td>
+                          <td className="py-3.5 px-4 text-[#5E5E6A]">
+                            {b.hargaOverride ? (
+                              <span className="font-bold text-[#4737FF]">
+                                {formatRupiah(b.hargaOverride)}
                               </span>
                             ) : (
-                              <span className="px-2 py-0.5 rounded-full bg-[#159A68]/15 text-[#159A68] text-[10px] font-extrabold">
-                                Aman ({diffDays} hr)
+                              <span className="text-[#77788A]">
+                                Harga Normal
                               </span>
                             )}
-                          </div>
-                        </td>
-                        <td className="py-3.5 px-4 text-[#5E5E6A]">
-                          {b.hargaOverride ? (
-                            <span className="font-bold text-[#4737FF]">
-                              {formatRupiah(b.hargaOverride)}
-                            </span>
-                          ) : (
-                            <span className="text-[#77788A]">Harga Normal</span>
-                          )}
-                          {b.diskon ? (
-                            <span className="ml-2 px-2 py-0.5 rounded-full bg-[#F75C03]/15 text-[#F75C03] text-[10px] font-extrabold">
-                              Diskon {b.diskon}%
-                            </span>
-                          ) : null}
-                        </td>
-                        <td className="py-3.5 px-4 text-right whitespace-nowrap">
-                          <div className="inline-flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => handleOpenEditBatch(b)}
-                              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl border border-[#E6E8F0] bg-white hover:border-[#4737FF] text-[#171725] text-[11px] font-semibold cursor-pointer"
-                            >
-                              <Pencil className="w-3 h-3" />
-                              <span>Edit</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setDeleteBatchTarget(b)}
-                              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl border border-[#E5484D]/30 bg-[#E5484D]/10 hover:bg-[#E5484D]/20 text-[#E5484D] text-[11px] font-semibold cursor-pointer"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                              <span>Hapus</span>
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
+                            {b.diskon ? (
+                              <span className="ml-2 px-2 py-0.5 rounded-full bg-[#F75C03]/15 text-[#F75C03] text-[10px] font-extrabold">
+                                Diskon {b.diskon}%
+                              </span>
+                            ) : null}
+                          </td>
+                          <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                            <div className="inline-flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenEditBatch(b)}
+                                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl border border-[#E6E8F0] bg-white hover:border-[#4737FF] text-[#171725] text-[11px] font-semibold cursor-pointer"
+                              >
+                                <Pencil className="w-3 h-3" />
+                                <span>Edit</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setDeleteBatchTarget(b)}
+                                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl border border-[#E5484D]/30 bg-[#E5484D]/10 hover:bg-[#E5484D]/20 text-[#E5484D] text-[11px] font-semibold cursor-pointer"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                                <span>Hapus</span>
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
         </section>
 
         {/* Modal Konfirmasi Hapus Batch */}
@@ -1470,6 +2041,144 @@ export default function AdminProductsPage() {
                   {isDeleting ? 'Menghapus...' : 'Ya, hapus produk'}
                 </button>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* Modal Kelola Harga Grosir Bertingkat (TieringPrice) */}
+        {tieringTargetProduct && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-[#101018]/60 backdrop-blur-xs p-4"
+          >
+            <div className="bg-white rounded-3xl p-6 max-w-lg w-full border border-[#E6E8F0] shadow-xl space-y-4">
+              <div className="flex items-start justify-between gap-3 pb-3 border-b border-[#E6E8F0]">
+                <div>
+                  <h3 className="font-heading text-base font-extrabold text-[#171725]">
+                    Kelola Harga Grosir (Tiering):{' '}
+                    {tieringTargetProduct.namaProduk}
+                  </h3>
+                  <p className="text-xs text-[#77788A] mt-0.5">
+                    Harga Eceran Normal:{' '}
+                    <strong>
+                      {formatRupiah(tieringTargetProduct.hargaEceran)}
+                    </strong>{' '}
+                    • Berlaku otomatis di Keranjang, Checkout &amp; Nota PDF
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTieringTargetProduct(null)}
+                  className="text-[#77788A] hover:text-[#171725] cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                <p className="text-xs font-bold text-[#171725]">
+                  Daftar Aturan Tiering Aktif:
+                </p>
+                {!tieringTargetProduct.tieringPrices ||
+                tieringTargetProduct.tieringPrices.length === 0 ? (
+                  <p className="text-xs text-[#77788A] bg-[#F8FAFF] rounded-xl p-3 border border-[#E6E8F0]">
+                    Belum ada aturan harga grosir untuk produk ini.
+                  </p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {tieringTargetProduct.tieringPrices.map((tier) => (
+                      <div
+                        key={tier.idTiering}
+                        className="flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl bg-[#F8FAFF] border border-[#E6E8F0] text-xs"
+                      >
+                        <div>
+                          <span className="font-bold text-[#171725]">
+                            Pembelian {tier.minQty} – {tier.maxQty} unit
+                          </span>
+                          <span className="ml-2 font-extrabold text-[#4737FF]">
+                            → {formatRupiah(tier.hargaPerUnit)} / unit
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteTieringRule(tier.idTiering)}
+                          className="text-[#E5484D] hover:underline font-bold cursor-pointer"
+                        >
+                          Hapus
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <form
+                onSubmit={handleAddTieringRule}
+                className="pt-3 border-t border-[#E6E8F0] space-y-3"
+              >
+                <p className="text-xs font-bold text-[#171725]">
+                  Tambah Rentang Kuantitas Baru:
+                </p>
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-[#5E5E6A] mb-1">
+                      Min. Qty *
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      required
+                      value={tierMinQty}
+                      onChange={(e) => setTierMinQty(e.target.value)}
+                      className="w-full rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-[#5E5E6A] mb-1">
+                      Maks. Qty *
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      required
+                      value={tierMaxQty}
+                      onChange={(e) => setTierMaxQty(e.target.value)}
+                      className="w-full rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-[#5E5E6A] mb-1">
+                      Harga / Unit (Rp) *
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      required
+                      value={tierHargaUnit}
+                      onChange={(e) => setTierHargaUnit(e.target.value)}
+                      className="w-full rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725]"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setTieringTargetProduct(null)}
+                    className="px-4 py-2 rounded-xl border border-[#E6E8F0] text-xs font-semibold text-[#171725] cursor-pointer"
+                  >
+                    Tutup
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSavingTier}
+                    className="px-4 py-2 rounded-xl bg-[#4737FF] hover:bg-[#3529BF] disabled:opacity-50 text-white text-xs font-bold cursor-pointer"
+                  >
+                    {isSavingTier ? 'Menyimpan...' : '+ Tambah Aturan Tiering'}
+                  </button>
+                </div>
+              </form>
             </div>
           </div>
         )}
