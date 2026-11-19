@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useSyncExternalStore } from 'react';
 import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -39,20 +39,15 @@ import { formatRupiah, getErrorMessage, getProductStock } from '@/lib/utils';
 import { useAuthStore } from '@/store/auth-store';
 import { useCartStore } from '@/store/cart-store';
 import ShopSidebar from '@/components/shop/sidebar';
-import ProductCard from '@/components/shop/product-card';
+import ProductCard, {
+  extractProductPromo,
+  formatProductExpDate,
+  resolveProductImageUrl,
+} from '@/components/shop/product-card';
 import HeroCarousel from '@/components/shop/hero-carousel';
 import ShopFooter from '@/components/shop/footer';
 import IncompleteProfileBanner from '@/components/auth/incomplete-profile-banner';
 import CustomerAvatar from '@/components/shop/customer-avatar';
-
-interface ProductPromoInfo {
-  isClearance: boolean;
-  discountPercent: number;
-  originalPrice: number | null;
-  effectivePrice: number;
-  stokClearance: number;
-  nearestExpDate: string | null;
-}
 
 const DEALS_MARQUEE_TEXTS = [
   '🔥 DISKON SPESIAL CLEARANCE H-7 HINGGA 50% & FEFO DEAL H-30 DISKON 20%!',
@@ -61,89 +56,6 @@ const DEALS_MARQUEE_TEXTS = [
   '📦 STOK BATCH PROMO TERBATAS — SIAPA CEPAT DIA DAPAT!',
   '🚚 GRATIS ONGKIR RADIUS ≤ 5 KM DENGAN KURIR TOKO BERINSULASI',
 ];
-
-function resolveProductImageUrl(rawUrl?: string | null): string | null {
-  if (!rawUrl || rawUrl.trim() === '') return null;
-  const trimmed = rawUrl.trim();
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-    return trimmed;
-  }
-  const baseUrl = (
-    api.defaults.baseURL ||
-    process.env.NEXT_PUBLIC_API_URL ||
-    'http://localhost:8080'
-  ).replace(/\/+$/, '');
-  return `${baseUrl}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`;
-}
-
-function extractProductPromo(
-  product: ProductCatalogResponse,
-  overridePercent?: number
-): ProductPromoInfo {
-  const raw = product as unknown as Record<string, unknown>;
-  const basePrice = Number(product.hargaEceran || 0);
-
-  const isClearance = Boolean(raw.isClearance);
-  const stokClearance =
-    typeof raw.stokClearance === 'number' ? raw.stokClearance : 0;
-  const hargaClearance =
-    typeof raw.hargaClearance === 'number' && raw.hargaClearance > 0
-      ? raw.hargaClearance
-      : null;
-  const nearestExpDate =
-    typeof raw.nearestExpDate === 'string' && raw.nearestExpDate.trim() !== ''
-      ? raw.nearestExpDate.trim()
-      : null;
-
-  if (isClearance && hargaClearance !== null && hargaClearance < basePrice) {
-    const pct = Math.max(
-      1,
-      Math.round(((basePrice - hargaClearance) / basePrice) * 100)
-    );
-    return {
-      isClearance: true,
-      discountPercent: pct,
-      originalPrice: basePrice,
-      effectivePrice: hargaClearance,
-      stokClearance,
-      nearestExpDate,
-    };
-  }
-
-  if (isClearance) {
-    const pct = overridePercent ?? 50;
-    const calculatedClearance = Math.round((basePrice * (100 - pct)) / 100);
-    return {
-      isClearance: true,
-      discountPercent: pct,
-      originalPrice: basePrice,
-      effectivePrice: calculatedClearance,
-      stokClearance,
-      nearestExpDate,
-    };
-  }
-
-  if (overridePercent && overridePercent > 0 && overridePercent < 90) {
-    const discounted = Math.round((basePrice * (100 - overridePercent)) / 100);
-    return {
-      isClearance: false,
-      discountPercent: overridePercent,
-      originalPrice: basePrice,
-      effectivePrice: discounted,
-      stokClearance: 0,
-      nearestExpDate,
-    };
-  }
-
-  return {
-    isClearance: false,
-    discountPercent: 0,
-    originalPrice: null,
-    effectivePrice: basePrice,
-    stokClearance: 0,
-    nearestExpDate,
-  };
-}
 
 function getCategoryVisual(categoryName: string) {
   const lower = categoryName.toLowerCase();
@@ -237,14 +149,28 @@ const CUSTOMER_REVIEWS = [
   },
 ];
 
+const emptySubscribe = () => () => {};
+const getClientMountedSnapshot = () => true;
+const getServerMountedSnapshot = () => false;
+
+function getClientMidnightMs(): number {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  return now.getTime();
+}
+
 export default function HomePage() {
   const user = useAuthStore((state) => state.user);
   const items = useCartStore((state) => state.items);
   const addItem = useCartStore((state) => state.addItem);
   const getTotalItems = useCartStore((state) => state.getTotalItems);
 
-  const [mounted, setMounted] = useState(false);
-  const [todayMs, setTodayMs] = useState<number | null>(null);
+  const mounted = useSyncExternalStore(
+    emptySubscribe,
+    getClientMountedSnapshot,
+    getServerMountedSnapshot
+  );
+  const todayMs = useMemo(() => (mounted ? getClientMidnightMs() : null), [mounted]);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [onlyAvailable, setOnlyAvailable] = useState<boolean>(false);
@@ -252,13 +178,6 @@ export default function HomePage() {
   const [isDealsPaused, setIsDealsPaused] = useState(false);
 
   const dealsSliderRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    setMounted(true);
-    const now = new Date();
-    now.setHours(0, 0, 0, 0);
-    setTodayMs(now.getTime());
-  }, []);
 
   const scrollDealsSlider = (direction: 'left' | 'right') => {
     const slider = dealsSliderRef.current;
@@ -432,35 +351,35 @@ export default function HomePage() {
           <IncompleteProfileBanner />
 
           {/* Header Bar Pencarian, Foto Profil & Keranjang */}
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-3.5 sm:p-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="bg-white rounded-2xl border border-[#E6E8F0] shadow-xs p-3.5 sm:p-4 flex flex-wrap items-center justify-between gap-3">
             <div className="relative flex-1 min-w-[220px] max-w-xl">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <Search className="w-4 h-4 text-[#5F6479] absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 type="search"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Cari bakso, nugget, dimsum, sosis premium..."
-                className="w-full rounded-lg border border-slate-200 bg-slate-50 focus:bg-white pl-9 pr-3.5 py-2 text-xs text-slate-800 focus:border-[#4737FF] focus:outline-none transition-colors"
+                className="w-full min-h-[40px] rounded-xl border border-[#E6E8F0] bg-slate-50 focus:bg-white pl-10 pr-3.5 py-2 text-sm text-[#171725] placeholder:text-[#5F6479] focus:border-[#4737FF] focus-visible:outline-2 focus-visible:outline-[#4737FF] transition-colors"
               />
             </div>
 
             <div className="flex items-center gap-2.5">
               {mounted && user && (
-                <div className="flex items-center gap-2.5 px-2.5 py-1.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs">
-                  {/* Klik foto untuk melihat ukuran penuh (Popup) */}
+                <div className="flex items-center gap-2.5 px-3 py-1.5 rounded-xl bg-slate-50 border border-[#E6E8F0] text-sm">
                   <CustomerAvatar
                     user={user as unknown as Record<string, unknown>}
                     size="sm"
                     enablePreview
                   />
-                  {/* Klik nama untuk menuju halaman Profil */}
                   <Link
                     href="/profile"
                     className="hidden sm:flex items-center gap-1.5 hover:text-[#4737FF] transition-colors"
                   >
-                    <span className="text-slate-500">Halo,</span>
-                    <strong className="text-slate-800">{user.nama}</strong>
-                    <span className="px-2 py-0.5 rounded-md bg-[#4737FF]/10 text-[#4737FF] text-[10px] font-extrabold">
+                    <span className="text-[#4B5068]">Halo,</span>
+                    <strong className="font-semibold text-[#171725]">
+                      {user.nama}
+                    </strong>
+                    <span className="px-2 py-0.5 rounded-md bg-[#4737FF]/10 text-[#4737FF] text-xs font-bold">
                       {user.tipeAkun}
                     </span>
                   </Link>
@@ -469,11 +388,11 @@ export default function HomePage() {
 
               <Link
                 href="/checkout"
-                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-[#F75C03] hover:bg-[#D94800] text-white text-xs font-bold shadow-2xs transition-colors"
+                className="min-h-[40px] inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-[#F75C03] hover:bg-[#D94800] text-white text-sm font-semibold shadow-2xs transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4737FF]"
               >
-                <ShoppingBag className="w-3.5 h-3.5" />
+                <ShoppingBag className="w-4 h-4" />
                 <span>Keranjang</span>
-                <span className="px-1.5 py-0.5 rounded-md bg-white text-[#F75C03] text-[10px] font-extrabold">
+                <span className="px-2 py-0.5 rounded-md bg-white text-[#C2410C] text-xs font-bold tabular-nums">
                   {totalCartItems}
                 </span>
               </Link>
@@ -484,8 +403,8 @@ export default function HomePage() {
           <HeroCarousel featuredProducts={activeProducts} />
 
           {/* Strip Keunggulan Utama */}
-          <section className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5">
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-100">
+          <section className="bg-white rounded-2xl border border-[#E6E8F0] shadow-xs p-4 sm:p-5">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 divide-y sm:divide-y-0 sm:divide-x divide-[#E6E8F0]">
               {[
                 {
                   icon: ShieldCheck,
@@ -495,7 +414,7 @@ export default function HomePage() {
                 {
                   icon: Snowflake,
                   title: 'Suhu -18°C Terjaga',
-                  desc: 'Freezer dikontrol ketat dengan rotasi stok FEFO otomatis.',
+                  desc: 'Freezer dikontrol ketat dengan rotasi stok terjadwal.',
                 },
                 {
                   icon: Truck,
@@ -516,14 +435,14 @@ export default function HomePage() {
                       idx > 0 ? 'pt-3 sm:pt-0 sm:pl-4' : ''
                     }`}
                   >
-                    <div className="w-9 h-9 rounded-xl bg-[#4737FF]/10 text-[#4737FF] flex items-center justify-center shrink-0">
-                      <Icon className="w-4 h-4" />
+                    <div className="w-10 h-10 rounded-xl bg-[#4737FF]/10 text-[#4737FF] flex items-center justify-center shrink-0">
+                      <Icon className="w-5 h-5" />
                     </div>
                     <div>
-                      <h3 className="font-heading text-xs font-bold text-slate-800">
+                      <h3 className="font-heading text-sm font-semibold text-[#171725]">
                         {item.title}
                       </h3>
-                      <p className="text-[11px] text-slate-500 mt-0.5 leading-relaxed">
+                      <p className="text-xs text-[#4B5068] mt-0.5 leading-relaxed">
                         {item.desc}
                       </p>
                     </div>
@@ -537,15 +456,15 @@ export default function HomePage() {
           {categories.length > 0 && (
             <section
               id="kategori-pilihan"
-              className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5 space-y-3.5"
+              className="bg-white rounded-2xl border border-[#E6E8F0] shadow-xs p-4 sm:p-5 space-y-4"
             >
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
-                  <span className="inline-flex items-center gap-1 text-[10px] font-extrabold uppercase tracking-wider text-[#4737FF]">
-                    <Sparkles className="w-3 h-3 text-[#F75C03]" />
+                  <span className="ff-eyebrow inline-flex items-center gap-1.5 text-xs font-semibold text-[#4737FF]">
+                    <Sparkles className="w-3.5 h-3.5 text-[#F75C03]" />
                     <span>SHOP BY CATEGORY</span>
                   </span>
-                  <h2 className="font-heading text-base sm:text-lg font-extrabold text-slate-800">
+                  <h2 className="font-heading text-xl sm:text-2xl font-bold text-[#171725] mt-0.5">
                     Belanja Berdasarkan Kategori
                   </h2>
                 </div>
@@ -558,7 +477,7 @@ export default function HomePage() {
                       .getElementById('katalog-produk')
                       ?.scrollIntoView({ behavior: 'smooth' });
                   }}
-                  className="text-xs font-bold text-[#4737FF] hover:underline cursor-pointer"
+                  className="text-sm font-semibold text-[#4737FF] hover:underline cursor-pointer"
                 >
                   Semua Kategori ({activeProducts.length}) →
                 </button>
@@ -580,15 +499,15 @@ export default function HomePage() {
                           .getElementById('katalog-produk')
                           ?.scrollIntoView({ behavior: 'smooth' });
                       }}
-                      className={`group text-left p-3.5 rounded-xl transition-all cursor-pointer flex flex-col justify-between min-h-[116px] ${
+                      className={`group text-left p-3.5 rounded-xl border transition-all cursor-pointer flex flex-col justify-between min-h-[120px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4737FF] ${
                         isSelected
-                          ? 'bg-[#4737FF] text-white shadow-xs'
-                          : 'bg-slate-50 hover:bg-[#4737FF]/8 text-slate-800'
+                          ? 'bg-[#4737FF] border-[#4737FF] text-white shadow-xs'
+                          : 'bg-slate-50 border-[#E6E8F0] hover:bg-[#4737FF]/8 hover:border-[#4737FF]/30 text-[#171725]'
                       }`}
                     >
                       <div className="flex items-center justify-between gap-2 w-full">
                         <div
-                          className={`w-8 h-8 rounded-lg flex items-center justify-center transition-transform group-hover:scale-105 ${
+                          className={`w-9 h-9 rounded-lg flex items-center justify-center transition-transform group-hover:scale-105 ${
                             isSelected
                               ? 'bg-white/20 text-white'
                               : 'bg-[#4737FF]/10 text-[#4737FF]'
@@ -597,10 +516,10 @@ export default function HomePage() {
                           <Icon className="w-4 h-4" />
                         </div>
                         <span
-                          className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                          className={`px-2 py-0.5 rounded-md text-xs font-semibold tabular-nums ${
                             isSelected
                               ? 'bg-white/20 text-white'
-                              : 'bg-white text-slate-600'
+                              : 'bg-white text-[#4B5068] border border-[#E6E8F0]'
                           }`}
                         >
                           {cat.count} item
@@ -609,15 +528,15 @@ export default function HomePage() {
 
                       <div className="mt-3">
                         <p
-                          className={`font-heading text-xs font-extrabold line-clamp-1 ${
-                            isSelected ? 'text-white' : 'text-slate-800'
+                          className={`font-heading text-sm font-semibold line-clamp-1 ${
+                            isSelected ? 'text-white' : 'text-[#171725]'
                           }`}
                         >
                           {cat.name}
                         </p>
                         <p
-                          className={`text-[11px] line-clamp-1 mt-0.5 ${
-                            isSelected ? 'text-white/80' : 'text-slate-500'
+                          className={`text-xs line-clamp-1 mt-0.5 ${
+                            isSelected ? 'text-white/85' : 'text-[#5F6479]'
                           }`}
                         >
                           {visual.desc}
@@ -630,13 +549,13 @@ export default function HomePage() {
             </section>
           )}
 
-          {/* 2. FEFO FLASH FOOD DEALS (Auto-Scroll + Running Marquee Diskon Spesial) */}
+          {/* 2. FEFO FLASH FOOD DEALS */}
           {fefoDealProducts.length > 0 && (
             <section
               id="fefo-deals"
               onMouseEnter={() => setIsDealsPaused(true)}
               onMouseLeave={() => setIsDealsPaused(false)}
-              className="relative rounded-2xl overflow-hidden border border-[#F75C03]/40 shadow-sm text-white"
+              className="relative rounded-2xl overflow-hidden border border-[#F75C03]/40 shadow-xs text-white"
               style={{
                 background:
                   'linear-gradient(135deg, #F75C03 0%, #D93800 50%, #3529BF 100%)',
@@ -653,13 +572,13 @@ export default function HomePage() {
               />
 
               {/* Pita Teks Berjalan Diskon Spesial */}
-              <div className="relative z-10 bg-black/20 backdrop-blur-xs border-b border-white/15 py-1.5 overflow-hidden">
+              <div className="relative z-10 bg-black/20 backdrop-blur-xs border-b border-white/15 py-2 overflow-hidden">
                 <div className="ff-marquee-track">
                   {[...DEALS_MARQUEE_TEXTS, ...DEALS_MARQUEE_TEXTS].map(
                     (text, idx) => (
                       <div
                         key={idx}
-                        className="inline-flex items-center gap-2 px-5 text-[11px] font-extrabold text-amber-200 whitespace-nowrap tracking-wide"
+                        className="inline-flex items-center gap-2 px-5 text-xs font-bold text-amber-200 whitespace-nowrap tracking-wide"
                       >
                         <Flame className="w-3.5 h-3.5 text-amber-300 fill-amber-300 shrink-0" />
                         <span>{text}</span>
@@ -670,39 +589,39 @@ export default function HomePage() {
                 </div>
               </div>
 
-              <div className="relative z-10 p-3.5 sm:p-4 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-white/20">
-                  <div className="space-y-0.5 min-w-0">
+              <div className="relative z-10 p-4 sm:p-5 space-y-3.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-white/20">
+                  <div className="space-y-1 min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-300 text-slate-900 text-[10px] font-extrabold uppercase tracking-wider shadow-2xs">
-                        <Zap className="w-3 h-3 fill-slate-900" />
-                        <span>BIG DEALS • FEFO FLASH SALE</span>
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-amber-300 text-[#171725] text-xs font-bold uppercase tracking-wider shadow-2xs">
+                        <Zap className="w-3.5 h-3.5 fill-[#171725]" />
+                        <span>BIG DEALS • FLASH SALE</span>
                       </span>
-                      <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white/15 border border-white/20 text-[10px] font-semibold text-white">
-                        <Snowflake className="w-3 h-3 text-amber-300" />
+                      <span className="hidden sm:inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-white/15 border border-white/20 text-xs font-semibold text-white">
+                        <Snowflake className="w-3.5 h-3.5 text-amber-300" />
                         <span>Kualitas Fresh -18°C Terjamin</span>
                       </span>
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-500/25 border border-emerald-300/30 text-[10px] font-bold text-emerald-100">
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-emerald-500/25 border border-emerald-300/30 text-xs font-bold text-emerald-100">
                         <span>
                           {isDealsPaused ? '⏸ Dijeda' : '▶ Geser Otomatis'}
                         </span>
                       </span>
                     </div>
 
-                    <h2 className="font-heading text-sm sm:text-base font-extrabold text-white tracking-tight">
-                      Penawaran Batch Prioritas FEFO (H-30 Diskon 20% • Clearance H-7 Diskon 50%)
+                    <h2 className="font-heading text-lg sm:text-xl font-bold text-white">
+                      Penawaran Batch Prioritas (H-30 Diskon 20% • Clearance H-7 Diskon 50%)
                     </h2>
                   </div>
 
                   <div className="flex items-center gap-1.5 shrink-0">
-                    <span className="text-[10px] font-semibold text-white/85 mr-1 hidden md:inline">
+                    <span className="text-xs font-semibold text-white/90 mr-1 hidden md:inline tabular-nums">
                       {fefoDealProducts.length} produk promo
                     </span>
                     <button
                       type="button"
                       onClick={() => scrollDealsSlider('left')}
                       aria-label="Geser produk promo ke kiri"
-                      className="w-7 h-7 rounded-lg bg-white/15 hover:bg-white/25 border border-white/20 flex items-center justify-center text-white transition-colors cursor-pointer"
+                      className="w-8 h-8 rounded-lg bg-white/15 hover:bg-white/25 border border-white/20 flex items-center justify-center text-white transition-colors cursor-pointer"
                     >
                       <ChevronLeft className="w-4 h-4" />
                     </button>
@@ -710,7 +629,7 @@ export default function HomePage() {
                       type="button"
                       onClick={() => scrollDealsSlider('right')}
                       aria-label="Geser produk promo ke kanan"
-                      className="w-7 h-7 rounded-lg bg-white/15 hover:bg-white/25 border border-white/20 flex items-center justify-center text-white transition-colors cursor-pointer"
+                      className="w-8 h-8 rounded-lg bg-white/15 hover:bg-white/25 border border-white/20 flex items-center justify-center text-white transition-colors cursor-pointer"
                     >
                       <ChevronRight className="w-4 h-4" />
                     </button>
@@ -734,15 +653,19 @@ export default function HomePage() {
                     }) => {
                       const isAdded = addedDealId === product.idProduk;
                       const imgUrl = resolveProductImageUrl(product.gambar);
+                      const dealExpInfo = formatProductExpDate(
+                        nearestExpDate,
+                        daysLeft
+                      );
 
                       return (
                         <div
                           key={product.idProduk}
-                          className="w-[310px] sm:w-[350px] shrink-0 snap-start group rounded-xl bg-white text-slate-800 p-3 shadow-sm hover:shadow-md transition-all flex items-center gap-3"
+                          className="w-[320px] sm:w-[360px] shrink-0 snap-start group rounded-2xl bg-white text-[#171725] p-3.5 shadow-xs hover:shadow-md transition-all flex items-center gap-3.5"
                         >
                           <Link
                             href={`/products/${product.idProduk}`}
-                            className="relative w-24 h-24 sm:w-26 sm:h-26 rounded-lg bg-slate-100 overflow-hidden block shrink-0"
+                            className="relative w-26 h-26 rounded-xl bg-slate-100 overflow-hidden block shrink-0"
                           >
                             {imgUrl ? (
                               // eslint-disable-next-line @next/next/no-img-element
@@ -757,30 +680,30 @@ export default function HomePage() {
                               </div>
                             )}
 
-                            <div className="absolute top-1.5 left-1.5 flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#F75C03] text-white text-[9px] font-extrabold shadow-2xs">
-                              <Tag className="w-2.5 h-2.5" />
-                              <span>Diskon {discountPct}%</span>
+                            <div className="absolute top-1.5 left-1.5 flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#F75C03] text-white text-xs font-bold shadow-2xs tabular-nums">
+                              <Tag className="w-3 h-3" />
+                              <span>-{discountPct}%</span>
                             </div>
 
                             <div className="absolute bottom-1.5 left-1.5 right-1.5 flex items-center justify-between gap-1">
-                              <span className="px-1.5 py-0.5 rounded bg-white/95 text-[#D93800] text-[9px] font-extrabold truncate shadow-2xs">
-                                {daysLeft !== null
-                                  ? `⏳ Exp ${daysLeft} Hari Lagi`
-                                  : nearestExpDate
-                                    ? `Exp ${nearestExpDate}`
-                                    : 'Prioritas FEFO'}
+                              <span className="px-2 py-0.5 rounded-md bg-white/95 text-[#C2410C] text-xs font-bold truncate shadow-2xs tabular-nums">
+                                {dealExpInfo
+                                  ? `Exp ${dealExpInfo.formatted}`
+                                  : daysLeft !== null
+                                    ? `Exp ${daysLeft} hari`
+                                    : 'Promo Batch'}
                               </span>
                             </div>
                           </Link>
 
-                          <div className="flex-1 min-w-0 flex flex-col justify-between h-full space-y-1.5">
-                            <div className="space-y-0.5">
-                              <div className="flex items-center justify-between gap-1">
-                                <span className="text-[9px] font-extrabold uppercase tracking-wider text-[#4737FF] truncate">
-                                  {product.kategori || 'Batch FEFO'}
+                          <div className="flex-1 min-w-0 flex flex-col justify-between h-full space-y-2">
+                            <div className="space-y-1">
+                              <div className="flex items-center justify-between gap-1.5">
+                                <span className="text-xs font-semibold text-[#4737FF] truncate">
+                                  {product.kategori || 'Frozen Food'}
                                 </span>
                                 {savedAmount > 0 && (
-                                  <span className="px-1.5 py-0.5 rounded bg-amber-100 text-[#D93800] text-[9px] font-extrabold shrink-0">
+                                  <span className="px-2 py-0.5 rounded-md bg-[#FFEDD5] text-[#C2410C] text-xs font-bold shrink-0 tabular-nums">
                                     Hemat {formatRupiah(savedAmount)}
                                   </span>
                                 )}
@@ -788,19 +711,19 @@ export default function HomePage() {
 
                               <Link
                                 href={`/products/${product.idProduk}`}
-                                className="font-heading text-xs sm:text-[13px] font-extrabold text-slate-800 hover:text-[#4737FF] line-clamp-1 block"
+                                className="font-heading text-sm font-semibold text-[#171725] hover:text-[#4737FF] line-clamp-1 block"
                               >
                                 {product.namaProduk}
                               </Link>
 
                               <div className="pt-0.5">
-                                <div className="flex justify-between text-[9px] text-slate-500 mb-0.5">
-                                  <span>Stok Batch Promo</span>
-                                  <span className="font-bold text-[#F75C03]">
+                                <div className="flex justify-between text-xs text-[#5F6479] mb-1 tabular-nums">
+                                  <span>Stok Promo</span>
+                                  <span className="font-semibold text-[#C2410C]">
                                     Sisa {displayStock} pack
                                   </span>
                                 </div>
-                                <div className="w-full h-1 rounded-full bg-slate-100 overflow-hidden">
+                                <div className="w-full h-1.5 rounded-full bg-slate-100 overflow-hidden">
                                   <div
                                     className="h-full bg-gradient-to-r from-[#F75C03] to-amber-500 rounded-full"
                                     style={{
@@ -814,17 +737,17 @@ export default function HomePage() {
                               </div>
                             </div>
 
-                            <div className="pt-1.5 border-t border-slate-100 flex items-end justify-between gap-2">
-                              <div className="min-w-0">
-                                <div className="flex items-center gap-1 leading-none">
-                                  <span className="text-[10px] text-slate-400 line-through font-semibold">
+                            <div className="pt-2 border-t border-[#E6E8F0] flex flex-wrap items-end justify-between gap-2">
+                              <div className="space-y-0.5">
+                                <div className="flex flex-wrap items-center gap-2 leading-none">
+                                  <span className="text-[13px] text-[#5F6479] line-through font-medium tabular-nums">
                                     {formatRupiah(originalPrice)}
                                   </span>
-                                  <span className="text-[9px] font-extrabold text-[#159A68]">
-                                    (-{discountPct}%)
+                                  <span className="px-1.5 py-0.5 rounded-md bg-[#FFEDD5] text-[#C2410C] text-xs font-bold leading-none tabular-nums">
+                                    -{discountPct}%
                                   </span>
                                 </div>
-                                <span className="font-heading text-sm font-extrabold text-[#F75C03] block whitespace-nowrap mt-0.5">
+                                <span className="font-heading text-base font-bold text-[#C2410C] block mt-0.5 tabular-nums">
                                   {formatRupiah(discountedPrice)}
                                 </span>
                               </div>
@@ -834,13 +757,13 @@ export default function HomePage() {
                                 onClick={() =>
                                   handleQuickAddDeal(product, discountedPrice)
                                 }
-                                className={`px-2.5 py-1.5 rounded-lg text-[10px] font-extrabold transition-all cursor-pointer inline-flex items-center gap-1 shrink-0 shadow-2xs ${
+                                className={`px-3 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer inline-flex items-center gap-1.5 shrink-0 shadow-2xs ${
                                   isAdded
                                     ? 'bg-[#159A68] text-white'
                                     : 'bg-[#F75C03] hover:bg-[#D94800] text-white'
                                 }`}
                               >
-                                <ShoppingBag className="w-3 h-3" />
+                                <ShoppingBag className="w-3.5 h-3.5" />
                                 <span>
                                   {isAdded ? 'Masuk!' : '+ Ambil Deal'}
                                 </span>
@@ -856,17 +779,17 @@ export default function HomePage() {
             </section>
           )}
 
-          {/* 3. KATALOG LENGKAP FROZEN FOOD */}
+          {/* 3. C. KATALOG LENGKAP FROZEN FOOD & TAB KATEGORI */}
           <section id="katalog-produk" className="space-y-4">
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5 space-y-3.5">
+            <div className="bg-white rounded-2xl border border-[#E6E8F0] shadow-xs p-4 sm:p-5 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h2 className="font-heading text-base sm:text-lg font-extrabold text-slate-800">
+                  <h2 className="font-heading text-2xl font-bold text-[#171725]">
                     Katalog Lengkap Lezzat Frozen Food
                   </h2>
-                  <p className="text-xs text-slate-500">
+                  <p className="text-sm text-[#5F6479] mt-0.5">
                     Menampilkan {filteredProducts.length} produk dari inventori
-                    aktif FEFO
+                    aktif siap kirim
                   </p>
                 </div>
 
@@ -875,18 +798,18 @@ export default function HomePage() {
                     <button
                       type="button"
                       onClick={() => setSelectedCategory('ALL')}
-                      className="px-3 py-1.5 rounded-lg bg-[#4737FF]/10 text-[#4737FF] text-xs font-bold cursor-pointer"
+                      className="min-h-[40px] px-3.5 py-2 rounded-xl bg-[#4737FF]/10 text-[#4737FF] text-sm font-semibold cursor-pointer"
                     >
                       Filter: {selectedCategory} ✕
                     </button>
                   )}
 
-                  <label className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-50 text-xs font-semibold text-slate-700 cursor-pointer">
+                  <label className="min-h-[40px] inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-50 border border-[#E6E8F0] text-sm font-medium text-[#171725] cursor-pointer">
                     <input
                       type="checkbox"
                       checked={onlyAvailable}
                       onChange={(e) => setOnlyAvailable(e.target.checked)}
-                      className="w-3.5 h-3.5 rounded accent-[#4737FF]"
+                      className="w-4 h-4 rounded accent-[#4737FF]"
                     />
                     <span>Stok Tersedia</span>
                   </label>
@@ -894,23 +817,30 @@ export default function HomePage() {
                   <button
                     type="button"
                     onClick={() => refetch()}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-50 hover:bg-slate-100 text-xs font-semibold text-slate-700 cursor-pointer"
+                    className="min-h-[40px] inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-50 hover:bg-slate-100 border border-[#E6E8F0] text-sm font-medium text-[#171725] cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4737FF]"
                   >
-                    <RefreshCw className="w-3.5 h-3.5 text-[#4737FF]" />
+                    <RefreshCw className="w-4 h-4 text-[#4737FF]" />
                     <span>Segarkan</span>
                   </button>
                 </div>
               </div>
 
+              {/* Tab Kategori: 14px, berat 500 (aktif 600), tinggi >= 40px, scroll-snap di mobile */}
               {categories.length > 0 && (
-                <div className="flex items-center gap-1.5 overflow-x-auto pt-1">
+                <div
+                  role="tablist"
+                  aria-label="Filter kategori produk"
+                  className="flex items-center gap-2 overflow-x-auto snap-x snap-mandatory scroll-smooth pt-1 pb-0.5 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+                >
                   <button
                     type="button"
+                    role="tab"
+                    aria-selected={selectedCategory === 'ALL'}
                     onClick={() => setSelectedCategory('ALL')}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-colors cursor-pointer ${
+                    className={`snap-start min-h-[40px] px-4 py-2 rounded-xl text-sm whitespace-nowrap transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4737FF] ${
                       selectedCategory === 'ALL'
-                        ? 'bg-[#4737FF] text-white'
-                        : 'bg-slate-50 text-slate-600 hover:bg-slate-100'
+                        ? 'bg-[#4737FF] text-white font-semibold shadow-2xs'
+                        : 'bg-slate-50 border border-[#E6E8F0] text-[#4B5068] font-medium hover:bg-slate-100 hover:text-[#171725]'
                     }`}
                   >
                     Semua ({activeProducts.length})
@@ -921,11 +851,13 @@ export default function HomePage() {
                       <button
                         key={cat.name}
                         type="button"
+                        role="tab"
+                        aria-selected={isActive}
                         onClick={() => setSelectedCategory(cat.name)}
-                        className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-colors cursor-pointer ${
+                        className={`snap-start min-h-[40px] px-4 py-2 rounded-xl text-sm whitespace-nowrap transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4737FF] ${
                           isActive
-                            ? 'bg-[#4737FF] text-white'
-                            : 'bg-slate-50 text-slate-600 hover:bg-slate-100'
+                            ? 'bg-[#4737FF] text-white font-semibold shadow-2xs'
+                            : 'bg-slate-50 border border-[#E6E8F0] text-[#4B5068] font-medium hover:bg-slate-100 hover:text-[#171725]'
                         }`}
                       >
                         {cat.name} ({cat.count})
@@ -937,27 +869,28 @@ export default function HomePage() {
             </div>
 
             {isLoading && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
                 {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
                   <div
                     key={n}
-                    className="rounded-xl border border-slate-200 bg-white h-72 animate-pulse p-3.5 space-y-3"
+                    className="rounded-2xl border border-[#E6E8F0] bg-white h-80 animate-pulse p-4 space-y-3"
                   >
-                    <div className="h-40 rounded-lg bg-slate-100" />
-                    <div className="h-3.5 w-2/3 rounded bg-slate-100" />
-                    <div className="h-3.5 w-1/2 rounded bg-slate-100" />
+                    <div className="h-40 rounded-xl bg-slate-100" />
+                    <div className="h-4 w-2/3 rounded bg-slate-100" />
+                    <div className="h-5 w-1/2 rounded bg-slate-100" />
+                    <div className="h-10 w-full rounded-xl bg-slate-100" />
                   </div>
                 ))}
               </div>
             )}
 
             {!isLoading && isError && (
-              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 text-center max-w-md mx-auto">
+              <div className="bg-white rounded-2xl border border-[#E6E8F0] shadow-xs p-6 text-center max-w-md mx-auto">
                 <AlertCircle className="w-8 h-8 text-red-500 mx-auto mb-2" />
-                <h3 className="font-heading text-sm font-bold text-slate-800 mb-1">
+                <h3 className="font-heading text-base font-bold text-[#171725] mb-1">
                   Gagal Memuat Katalog Produk
                 </h3>
-                <p className="text-xs text-slate-500 mb-4">
+                <p className="text-sm text-[#4B5068] mb-4">
                   {getErrorMessage(
                     error,
                     'Pastikan server backend sedang berjalan.'
@@ -966,7 +899,7 @@ export default function HomePage() {
                 <button
                   type="button"
                   onClick={() => refetch()}
-                  className="px-4 py-2 rounded-lg bg-[#4737FF] text-white text-xs font-bold cursor-pointer"
+                  className="min-h-[40px] px-4 py-2 rounded-xl bg-[#4737FF] text-white text-sm font-semibold cursor-pointer"
                 >
                   Muat Ulang Katalog
                 </button>
@@ -974,12 +907,12 @@ export default function HomePage() {
             )}
 
             {!isLoading && !isError && filteredProducts.length === 0 && (
-              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-8 text-center">
+              <div className="bg-white rounded-2xl border border-[#E6E8F0] shadow-xs p-8 text-center">
                 <Layers className="w-8 h-8 text-[#4737FF]/50 mx-auto mb-2" />
-                <h3 className="font-heading text-sm font-bold text-slate-800 mb-1">
+                <h3 className="font-heading text-base font-bold text-[#171725] mb-1">
                   Produk Tidak Ditemukan
                 </h3>
-                <p className="text-xs text-slate-500 mb-3">
+                <p className="text-sm text-[#4B5068] mb-4">
                   Coba ubah kata kunci pencarian atau reset filter kategori.
                 </p>
                 <button
@@ -989,15 +922,16 @@ export default function HomePage() {
                     setSelectedCategory('ALL');
                     setOnlyAvailable(false);
                   }}
-                  className="px-3.5 py-2 rounded-lg bg-[#4737FF] text-white text-xs font-bold cursor-pointer"
+                  className="min-h-[40px] px-4 py-2 rounded-xl bg-[#4737FF] text-white text-sm font-semibold cursor-pointer"
                 >
                   Reset Filter
                 </button>
               </div>
             )}
 
+            {/* Grid Katalog: 2 kolom di mobile & sm, 3 kolom di lg (>=1024px), 4 kolom di xl (>=1280px) */}
             {!isLoading && !isError && filteredProducts.length > 0 && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
                 {filteredProducts.map((product) => (
                   <ProductCard key={product.idProduk} product={product} />
                 ))}
@@ -1008,66 +942,72 @@ export default function HomePage() {
           {/* 4. PENILAIAN & ULASAN PELANGGAN */}
           <section
             id="ulasan-pelanggan"
-            className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5 space-y-4"
+            className="bg-white rounded-2xl border border-[#E6E8F0] shadow-xs p-4 sm:p-5 space-y-4"
           >
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-center pb-4 border-b border-slate-100">
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-center pb-4 border-b border-[#E6E8F0]">
               <div className="lg:col-span-5 flex items-center gap-4">
-                <div className="w-18 h-18 rounded-2xl bg-[#4737FF] text-white flex flex-col items-center justify-center shrink-0 p-3">
-                  <span className="font-heading text-2xl font-extrabold leading-none">
+                <div className="w-18 h-18 rounded-2xl bg-[#4737FF] text-white flex flex-col items-center justify-center shrink-0 p-3 tabular-nums">
+                  <span className="font-heading text-2xl font-bold leading-none">
                     4.9
                   </span>
-                  <span className="text-[10px] text-white/80 mt-1">
+                  <span className="text-xs text-white/85 mt-1">
                     dari 5.0
                   </span>
                 </div>
 
                 <div className="space-y-1">
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 text-[#159A68] text-[10px] font-bold">
-                    <ThumbsUp className="w-3 h-3" />
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-emerald-50 text-[#159A68] text-xs font-bold">
+                    <ThumbsUp className="w-3.5 h-3.5" />
                     <span>99% Pelanggan Puas</span>
                   </span>
-                  <h2 className="font-heading text-base sm:text-lg font-extrabold text-slate-800">
+                  <h2 className="font-heading text-lg sm:text-xl font-bold text-[#171725]">
                     Penilaian Toko dari Pelanggan
                   </h2>
-                  <p className="text-xs text-slate-500">
-                    Ulasan terverifikasi pelanggan B2C & mitra usaha B2B.
+                  <p className="text-sm text-[#5F6479]">
+                    Ulasan terverifikasi pelanggan B2C &amp; mitra usaha B2B.
                   </p>
                 </div>
               </div>
 
-              <div className="lg:col-span-7 grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
-                <div className="p-3 rounded-xl bg-slate-50">
+              <div className="lg:col-span-7 grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-sm">
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-[#E6E8F0]">
                   <div className="flex items-center justify-between mb-1">
-                    <span className="font-semibold text-slate-700">
+                    <span className="font-semibold text-[#171725]">
                       Suhu Beku
                     </span>
-                    <span className="font-extrabold text-[#159A68]">5.0 ★</span>
+                    <span className="font-bold text-[#159A68] tabular-nums">
+                      5.0 ★
+                    </span>
                   </div>
-                  <p className="text-[11px] text-slate-500">
+                  <p className="text-xs text-[#4B5068]">
                     Tetap -18°C saat tiba
                   </p>
                 </div>
 
-                <div className="p-3 rounded-xl bg-slate-50">
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-[#E6E8F0]">
                   <div className="flex items-center justify-between mb-1">
-                    <span className="font-semibold text-slate-700">
+                    <span className="font-semibold text-[#171725]">
                       Kurir Toko
                     </span>
-                    <span className="font-extrabold text-[#4737FF]">4.9 ★</span>
+                    <span className="font-bold text-[#4737FF] tabular-nums">
+                      4.9 ★
+                    </span>
                   </div>
-                  <p className="text-[11px] text-slate-500">
+                  <p className="text-xs text-[#4B5068]">
                     Tepat sesuai estimasi WIB
                   </p>
                 </div>
 
-                <div className="p-3 rounded-xl bg-slate-50">
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-[#E6E8F0]">
                   <div className="flex items-center justify-between mb-1">
-                    <span className="font-semibold text-slate-700">
-                      Stok FEFO
+                    <span className="font-semibold text-[#171725]">
+                      Kualitas Stok
                     </span>
-                    <span className="font-extrabold text-[#4737FF]">4.9 ★</span>
+                    <span className="font-bold text-[#4737FF] tabular-nums">
+                      4.9 ★
+                    </span>
                   </div>
-                  <p className="text-[11px] text-slate-500">
+                  <p className="text-xs text-[#4B5068]">
                     Masa kedaluwarsa panjang
                   </p>
                 </div>
@@ -1078,7 +1018,7 @@ export default function HomePage() {
               {CUSTOMER_REVIEWS.map((rev) => (
                 <div
                   key={rev.id}
-                  className="p-3.5 rounded-xl bg-slate-50 flex flex-col justify-between space-y-2.5"
+                  className="p-4 rounded-xl bg-slate-50 border border-[#E6E8F0] flex flex-col justify-between space-y-3"
                 >
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
@@ -1086,40 +1026,38 @@ export default function HomePage() {
                         {Array.from({ length: rev.rating }).map((_, i) => (
                           <Star
                             key={i}
-                            className="w-3 h-3 fill-[#F75C03] text-[#F75C03]"
+                            className="w-3.5 h-3.5 fill-[#F75C03] text-[#F75C03]"
                           />
                         ))}
                       </div>
-                      <span className="text-[10px] text-slate-400">
-                        {rev.date}
-                      </span>
+                      <span className="text-xs text-[#5F6479]">{rev.date}</span>
                     </div>
 
-                    <span className="inline-block px-2 py-0.5 rounded-md bg-[#4737FF]/10 text-[#4737FF] text-[10px] font-bold">
+                    <span className="inline-block px-2.5 py-0.5 rounded-md bg-[#4737FF]/10 text-[#4737FF] text-xs font-semibold">
                       {rev.tag}
                     </span>
 
-                    <p className="text-xs text-slate-600 leading-relaxed">
-                      <Quote className="w-3 h-3 text-slate-400 inline mr-1 -mt-0.5" />
+                    <p className="text-sm text-[#4B5068] leading-relaxed">
+                      <Quote className="w-3.5 h-3.5 text-[#5F6479] inline mr-1 -mt-0.5" />
                       {rev.comment}
                     </p>
                   </div>
 
-                  <div className="pt-2.5 border-t border-slate-200/60 flex items-center justify-between gap-2">
+                  <div className="pt-2.5 border-t border-[#E6E8F0] flex items-center justify-between gap-2">
                     <div className="min-w-0">
-                      <p className="text-xs font-bold text-slate-800 truncate">
+                      <p className="text-sm font-semibold text-[#171725] truncate">
                         {rev.name}
                       </p>
-                      <p className="text-[10px] text-slate-500 truncate">
+                      <p className="text-xs text-[#5F6479] truncate">
                         {rev.role}
                       </p>
                     </div>
                     {rev.verified && (
                       <span
                         title="Transaksi Terverifikasi"
-                        className="w-5 h-5 rounded-full bg-emerald-50 text-[#159A68] flex items-center justify-center shrink-0"
+                        className="w-6 h-6 rounded-full bg-emerald-50 text-[#159A68] flex items-center justify-center shrink-0"
                       >
-                        <PackageCheck className="w-3 h-3" />
+                        <PackageCheck className="w-3.5 h-3.5" />
                       </span>
                     )}
                   </div>
@@ -1129,62 +1067,62 @@ export default function HomePage() {
           </section>
 
           {/* 5. TENTANG LEZZAT FROZEN FOOD */}
-          <section className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5 grid grid-cols-1 lg:grid-cols-12 gap-5 items-center">
+          <section className="bg-white rounded-2xl border border-[#E6E8F0] shadow-xs p-4 sm:p-5 grid grid-cols-1 lg:grid-cols-12 gap-5 items-center">
             <div className="lg:col-span-7 space-y-2.5">
-              <span className="inline-block px-2.5 py-0.5 rounded-md bg-[#4737FF]/10 text-[#4737FF] text-[10px] font-extrabold uppercase tracking-wider">
+              <span className="ff-eyebrow inline-block px-2.5 py-0.5 rounded-md bg-[#4737FF]/10 text-[#4737FF] text-xs font-semibold">
                 TENTANG LEZZAT FROZEN FOOD
               </span>
-              <h2 className="font-heading text-base sm:text-lg font-extrabold text-slate-800">
-                Solusi Rantai Dingin Terpadu untuk Rumah Tangga & Bisnis Kuliner
+              <h2 className="font-heading text-lg sm:text-xl font-bold text-[#171725]">
+                Solusi Rantai Dingin Terpadu untuk Rumah Tangga &amp; Bisnis Kuliner
               </h2>
-              <p className="text-xs text-slate-500 leading-relaxed">
+              <p className="text-sm text-[#4B5068] leading-relaxed">
                 <strong>Lezzat Frozen Food (Froznfood 2.0)</strong>{' '}
-                mengintegrasikan manajemen inventori{' '}
-                <em>First Expired, First Out (FEFO)</em> dengan pengiriman
-                berpendingin. Baik untuk belanja rumah tangga (B2C) maupun
-                pasokan rutin restoran, kafe, dan reseller (B2B).
+                mengintegrasikan manajemen inventori berdasarkan masa kedaluwarsa
+                terdekat dengan pengiriman berpendingin. Baik untuk belanja rumah
+                tangga (B2C) maupun pasokan rutin restoran, kafe, dan reseller
+                (B2B).
               </p>
               <div className="pt-1 flex flex-wrap items-center gap-2.5">
                 <Link
                   href="/register"
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#4737FF] hover:bg-[#3529BF] text-white text-xs font-bold transition-colors"
+                  className="min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[#4737FF] hover:bg-[#3529BF] text-white text-sm font-semibold transition-colors"
                 >
-                  <Building2 className="w-3.5 h-3.5" />
+                  <Building2 className="w-4 h-4" />
                   <span>Gabung Mitra B2B / Pelanggan</span>
-                  <ArrowRight className="w-3.5 h-3.5" />
+                  <ArrowRight className="w-4 h-4" />
                 </Link>
                 <Link
                   href="/orders"
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-colors"
+                  className="min-h-[40px] inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-[#171725] text-sm font-semibold transition-colors"
                 >
-                  <FileText className="w-3.5 h-3.5 text-[#4737FF]" />
-                  <span>Lacak Pesanan & Nota PDF</span>
+                  <FileText className="w-4 h-4 text-[#4737FF]" />
+                  <span>Lacak Pesanan &amp; Nota PDF</span>
                 </Link>
               </div>
             </div>
 
-            <div className="lg:col-span-5 grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-              <div className="p-3.5 rounded-xl bg-slate-50 space-y-1">
-                <div className="w-7 h-7 rounded-lg bg-[#4737FF]/10 text-[#4737FF] flex items-center justify-center">
-                  <Clock className="w-3.5 h-3.5" />
+            <div className="lg:col-span-5 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-[#E6E8F0] space-y-1">
+                <div className="w-8 h-8 rounded-lg bg-[#4737FF]/10 text-[#4737FF] flex items-center justify-center">
+                  <Clock className="w-4 h-4" />
                 </div>
-                <p className="font-heading font-bold text-slate-800">
+                <p className="font-heading font-semibold text-[#171725]">
                   Jadwal Sameday
                 </p>
-                <p className="text-[11px] text-slate-500 leading-relaxed">
+                <p className="text-xs text-[#4B5068] leading-relaxed">
                   Buka 09.00–21.00 WIB. Pesan sebelum 15.00 WIB dikirim hari ini.
                 </p>
               </div>
 
-              <div className="p-3.5 rounded-xl bg-slate-50 space-y-1">
-                <div className="w-7 h-7 rounded-lg bg-emerald-50 text-[#159A68] flex items-center justify-center">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-[#E6E8F0] space-y-1">
+                <div className="w-8 h-8 rounded-lg bg-emerald-50 text-[#159A68] flex items-center justify-center">
+                  <CheckCircle2 className="w-4 h-4" />
                 </div>
-                <p className="font-heading font-bold text-slate-800">
+                <p className="font-heading font-semibold text-[#171725]">
                   Nota PDF Resmi
                 </p>
-                <p className="text-[11px] text-slate-500 leading-relaxed">
-                  Pembayaran QRIS & VA Midtrans disertai unduhan invoice PDF.
+                <p className="text-xs text-[#4B5068] leading-relaxed">
+                  Pembayaran QRIS &amp; VA Midtrans disertai unduhan invoice PDF.
                 </p>
               </div>
             </div>

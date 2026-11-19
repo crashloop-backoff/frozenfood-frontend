@@ -9,6 +9,7 @@ import {
   Truck,
   Package,
   Users,
+  MessageSquare,
   Store,
   LogOut,
   Menu,
@@ -16,12 +17,14 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth-store';
+import { useAdminUnreadChatCount } from '@/store/chat-store';
 
 function AdminSidebarInner() {
   const pathname = usePathname();
   const router = useRouter();
   const user = useAuthStore((state) => state.user);
   const logout = useAuthStore((state) => state.logout);
+  const unreadChatCount = useAdminUnreadChatCount();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const handleLogout = () => {
@@ -55,12 +58,22 @@ function AdminSidebarInner() {
       icon: Users,
       active: pathname.startsWith('/admin/customers'),
     },
+    {
+      href: '/admin/chats',
+      label: 'Chat Pelanggan',
+      icon: MessageSquare,
+      active: pathname.startsWith('/admin/chats'),
+      unreadBadge: unreadChatCount > 0 ? unreadChatCount : undefined,
+    },
   ];
 
   return (
     <>
       <header className="lg:hidden sticky top-0 z-40 bg-[#101018] text-white px-4 py-3.5 flex items-center justify-between">
-        <Link href="/admin/dashboard" className="flex items-center gap-2.5">
+        <Link
+          href="/admin/dashboard"
+          className="flex items-center gap-2.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white rounded-xl"
+        >
           <div className="w-8 h-8 rounded-xl bg-[#4737FF] flex items-center justify-center text-white">
             <Snowflake className="w-4 h-4" />
           </div>
@@ -74,13 +87,33 @@ function AdminSidebarInner() {
           </div>
         </Link>
 
-        <button
-          type="button"
-          onClick={() => setMobileOpen((prev) => !prev)}
-          className="p-2 rounded-xl bg-white/10 text-white cursor-pointer"
-        >
-          {mobileOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
-        </button>
+        <div className="flex items-center gap-2">
+          {unreadChatCount > 0 && (
+            <Link
+              href="/admin/chats"
+              aria-label={`Chat Pelanggan (${unreadChatCount} pesan belum dibaca)`}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-[#F75C03] text-white text-[11px] font-extrabold focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              <span>{unreadChatCount > 99 ? '99+' : unreadChatCount}</span>
+            </Link>
+          )}
+
+          <button
+            type="button"
+            onClick={() => setMobileOpen((prev) => !prev)}
+            aria-label={
+              mobileOpen ? 'Tutup menu navigasi admin' : 'Buka menu navigasi admin'
+            }
+            className="p-2 rounded-xl bg-white/10 text-white cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+          >
+            {mobileOpen ? (
+              <X className="w-5 h-5" />
+            ) : (
+              <Menu className="w-5 h-5" />
+            )}
+          </button>
+        </div>
       </header>
 
       {mobileOpen && (
@@ -100,7 +133,7 @@ function AdminSidebarInner() {
             <Link
               href="/admin/dashboard"
               onClick={() => setMobileOpen(false)}
-              className="flex items-center gap-3"
+              className="flex items-center gap-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white rounded-xl"
             >
               <div className="w-10 h-10 rounded-2xl bg-[#4737FF] flex items-center justify-center text-white shadow-lg shadow-[#4737FF]/30">
                 <Snowflake className="w-5 h-5" />
@@ -136,22 +169,38 @@ function AdminSidebarInner() {
             <p className="px-3 text-[10px] font-bold uppercase tracking-[0.15em] text-[#77788A] mb-2">
               MANAJEMEN OPERASIONAL
             </p>
-            <nav className="space-y-1">
+            <nav aria-label="Menu operasional admin" className="space-y-1">
               {adminNavItems.map((item) => {
                 const Icon = item.icon;
+                const badgeVal = item.unreadBadge;
+                const badgeText =
+                  badgeVal && badgeVal > 99 ? '99+' : badgeVal;
+
                 return (
                   <Link
                     key={item.href}
                     href={item.href}
                     onClick={() => setMobileOpen(false)}
-                    className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
+                    aria-current={item.active ? 'page' : undefined}
+                    className={`flex items-center justify-between gap-2.5 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white ${
                       item.active
                         ? 'bg-[#4737FF] text-white shadow-md shadow-[#4737FF]/30'
                         : 'text-slate-300 hover:bg-white/10 hover:text-white'
                     }`}
                   >
-                    <Icon className="w-4 h-4 shrink-0" />
-                    <span>{item.label}</span>
+                    <span className="flex items-center gap-3 min-w-0">
+                      <Icon className="w-4 h-4 shrink-0" />
+                      <span className="truncate">{item.label}</span>
+                    </span>
+
+                    {badgeVal && badgeVal > 0 && (
+                      <span
+                        aria-label={`${badgeVal} pesan belum dibaca`}
+                        className="min-w-[20px] h-5 px-1.5 rounded-full bg-[#F75C03] text-white text-[10px] font-extrabold inline-flex items-center justify-center leading-none shrink-0"
+                      >
+                        {badgeText}
+                      </span>
+                    )}
                   </Link>
                 );
               })}
@@ -163,7 +212,7 @@ function AdminSidebarInner() {
           <Link
             href="/"
             onClick={() => setMobileOpen(false)}
-            className="w-full flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-semibold transition-colors"
+            className="w-full flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
           >
             <Store className="w-4 h-4 text-[#ACA5FF]" />
             <span>Lihat Toko Pelanggan</span>
@@ -172,7 +221,7 @@ function AdminSidebarInner() {
           <button
             type="button"
             onClick={handleLogout}
-            className="w-full flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl border border-red-500/30 hover:bg-red-500/15 text-red-400 text-xs font-semibold transition-colors cursor-pointer"
+            className="w-full flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl border border-red-500/30 hover:bg-red-500/15 text-red-400 text-xs font-semibold transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-400"
           >
             <LogOut className="w-4 h-4" />
             <span>Keluar Sesi Admin</span>
