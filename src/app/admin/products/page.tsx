@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo, useEffect } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -90,7 +90,65 @@ function formatWeightDisplay(rawBerat: number | undefined | null): string {
   return `${grams.toLocaleString('id-ID')} g`;
 }
 
+function deduplicateExpiryAlerts(
+  alerts: ExpiryAlertResponse[],
+  resolvedByBatchMap: Record<string, ExpiryAlertResponse> = {}
+): ExpiryAlertResponse[] {
+  const byAlertId = new Map<string, ExpiryAlertResponse>();
+  const byBatchId = new Map<string, ExpiryAlertResponse>();
+
+  const combined = [...alerts, ...Object.values(resolvedByBatchMap)];
+
+  // 1. Deduplikasi berdasarkan idAlert (prioritaskan status isResolved = true)
+  for (const item of combined) {
+    if (!item) continue;
+    const alertKey = String(item.idAlert || item.idProdBatch || '').trim();
+    if (!alertKey) continue;
+
+    const batchKey = String(item.idProdBatch || item.idAlert || '').trim();
+    const isKnownResolved = Boolean(
+      item.isResolved ||
+        (batchKey && resolvedByBatchMap[batchKey]?.isResolved) ||
+        (alertKey && resolvedByBatchMap[alertKey]?.isResolved)
+    );
+
+    const normalized: ExpiryAlertResponse = {
+      ...item,
+      isResolved: isKnownResolved,
+    };
+
+    const existingByAlert = byAlertId.get(alertKey);
+    if (!existingByAlert) {
+      byAlertId.set(alertKey, normalized);
+    } else if (!existingByAlert.isResolved && normalized.isResolved) {
+      byAlertId.set(alertKey, normalized);
+    }
+  }
+
+  // 2. Deduplikasi berdasarkan idProdBatch (prioritaskan objek data yang sudah resolved)
+  for (const item of byAlertId.values()) {
+    const batchKey = String(item.idProdBatch || item.idAlert || '').trim();
+    if (!batchKey) continue;
+
+    const existingByBatch = byBatchId.get(batchKey);
+    if (!existingByBatch) {
+      byBatchId.set(batchKey, item);
+    } else if (!existingByBatch.isResolved && item.isResolved) {
+      byBatchId.set(batchKey, item);
+    } else if (existingByBatch.isResolved === item.isResolved) {
+      const existingTime = Date.parse(existingByBatch.createdAt || '') || 0;
+      const currentTime = Date.parse(item.createdAt || '') || 0;
+      if (currentTime > existingTime) {
+        byBatchId.set(batchKey, item);
+      }
+    }
+  }
+
+  return Array.from(byBatchId.values());
+}
+
 export default function AdminProductsPage() {
+  const queryClient = useQueryClient();
   // State waktu client-side (diisi di useEffect agar bebas error prerender Next.js 16)
   const [nowMs, setNowMs] = useState<number | null>(null);
   const [minExpDate, setMinExpDate] = useState<string>('');
@@ -109,7 +167,7 @@ export default function AdminProductsPage() {
   const [selectedCategoryFilter, setSelectedCategoryFilter] =
     useState<string>('ALL');
   const [productStatusFilter, setProductStatusFilter] = useState<
-    'ALL' | 'AVAILABLE' | 'PROMO' | 'OUT_OF_STOCK'
+    'ALL' | 'AVAILABLE' | 'PROMO' | 'OUT_OF_STOCK' | 'INACTIVE'
   >('ALL');
 
   const [isFormOpen, setIsFormOpen] = useState<boolean>(false);
@@ -135,6 +193,9 @@ export default function AdminProductsPage() {
 
   const [showResolvedAlerts, setShowResolvedAlerts] = useState<boolean>(false);
   const [resolvingAlertId, setResolvingAlertId] = useState<string | null>(null);
+  const [resolvedAlertsMap, setResolvedAlertsMap] = useState<
+    Record<string, ExpiryAlertResponse>
+  >({});
 
   const [tieringTargetProduct, setTieringTargetProduct] =
     useState<ProductCatalogResponse | null>(null);
@@ -181,7 +242,7 @@ export default function AdminProductsPage() {
   });
 
   const {
-    data: expiryAlerts = [],
+    data: rawExpiryAlerts = [],
     isLoading: isLoadingAlerts,
     refetch: refetchAlerts,
   } = useQuery<ExpiryAlertResponse[]>({
@@ -193,9 +254,22 @@ export default function AdminProductsPage() {
           params: { unresolvedOnly: !showResolvedAlerts },
         }
       );
-      return res.data;
+      const list = Array.isArray(res.data) ? res.data : [];
+      return deduplicateExpiryAlerts(list);
     },
   });
+
+  // Deduplikasi state array Expiry Alert
+  const deduplicatedExpiryAlerts = useMemo(() => {
+    return deduplicateExpiryAlerts(rawExpiryAlerts, resolvedAlertsMap);
+  }, [rawExpiryAlerts, resolvedAlertsMap]);
+
+  // Filter eksklusif Aktif vs Selesai sebelum di-mapping ke UI
+  const expiryAlerts = useMemo(() => {
+    return deduplicatedExpiryAlerts.filter((item) =>
+      showResolvedAlerts ? Boolean(item.isResolved) : !item.isResolved
+    );
+  }, [deduplicatedExpiryAlerts, showResolvedAlerts]);
 
   const {
     register,
@@ -271,6 +345,8 @@ export default function AdminProductsPage() {
       if (productStatusFilter === 'AVAILABLE' && stock <= 0) return false;
       if (productStatusFilter === 'PROMO' && !hasPromoOrTier) return false;
       if (productStatusFilter === 'OUT_OF_STOCK' && stock > 0) return false;
+      if (productStatusFilter === 'INACTIVE' && p.isActive !== false)
+        return false;
 
       if (!kw) return true;
 
@@ -591,12 +667,80 @@ export default function AdminProductsPage() {
     }
   };
 
+  const handleToggleShowResolvedAlerts = (checked: boolean) => {
+    // Simpan seluruh alert yang sudah resolved dari state saat ini agar tidak duplikat saat checkbox di-toggle
+    setResolvedAlertsMap((prev) => {
+      const next = { ...prev };
+      rawExpiryAlerts.forEach((item) => {
+        if (item.isResolved) {
+          const batchKey = String(
+            item.idProdBatch || item.idAlert || ''
+          ).trim();
+          if (batchKey) {
+            next[batchKey] = { ...item, isResolved: true };
+          }
+        }
+      });
+      return next;
+    });
+
+    setShowResolvedAlerts(checked);
+  };
+
   const handleResolveAlert = async (alertItem: ExpiryAlertResponse) => {
     setActionError(null);
     setActionSuccess(null);
     setResolvingAlertId(alertItem.idAlert);
     try {
       await api.patch(`/api/inventory/alerts/${alertItem.idAlert}/resolve`);
+
+      // Jika terdapat alert duplikat lain untuk batch yang sama yang masih unresolved, tandai selesai juga
+      const duplicateUnresolved = rawExpiryAlerts.filter(
+        (a) =>
+          a.idProdBatch === alertItem.idProdBatch &&
+          a.idAlert !== alertItem.idAlert &&
+          !a.isResolved
+      );
+      if (duplicateUnresolved.length > 0) {
+        await Promise.all(
+          duplicateUnresolved.map((dup) =>
+            api
+              .patch(`/api/inventory/alerts/${dup.idAlert}/resolve`)
+              .catch(() => null)
+          )
+        );
+      }
+
+      const resolvedItem: ExpiryAlertResponse = {
+        ...alertItem,
+        isResolved: true,
+      };
+      const batchKey = String(
+        alertItem.idProdBatch || alertItem.idAlert || ''
+      ).trim();
+
+      setResolvedAlertsMap((prev) => ({
+        ...prev,
+        ...(batchKey ? { [batchKey]: resolvedItem } : {}),
+      }));
+
+      queryClient.setQueriesData<ExpiryAlertResponse[]>(
+        { queryKey: ['admin-expiry-alerts'] },
+        (oldData) => {
+          if (!Array.isArray(oldData)) return oldData;
+          const updated = oldData.map((item) =>
+            item.idAlert === alertItem.idAlert ||
+            item.idProdBatch === alertItem.idProdBatch
+              ? { ...item, isResolved: true }
+              : item
+          );
+          return deduplicateExpiryAlerts(
+            updated,
+            batchKey ? { [batchKey]: resolvedItem } : {}
+          );
+        }
+      );
+
       setActionSuccess(
         `Peringatan kedaluwarsa untuk batch "${alertItem.idProdBatch}" telah ditandai selesai.`
       );
@@ -775,7 +919,8 @@ export default function AdminProductsPage() {
                     Peringatan Kedaluwarsa & Otomasi Flash Deals (Expiry Alert)
                   </h2>
                   <span className="px-2.5 py-0.5 rounded-full bg-[#F75C03] text-white text-[10px] font-extrabold">
-                    {expiryAlerts.filter((a) => !a.isResolved).length} Aktif
+                    {deduplicatedExpiryAlerts.filter((a) => !a.isResolved).length}{' '}
+                    Aktif
                   </span>
                 </div>
                 <p className="text-xs text-[#77788A]">
@@ -790,7 +935,9 @@ export default function AdminProductsPage() {
               <input
                 type="checkbox"
                 checked={showResolvedAlerts}
-                onChange={(e) => setShowResolvedAlerts(e.target.checked)}
+                onChange={(e) =>
+                  handleToggleShowResolvedAlerts(e.target.checked)
+                }
                 className="w-3.5 h-3.5 rounded accent-[#4737FF]"
               />
               <span>Tampilkan yang sudah selesai</span>
@@ -803,8 +950,9 @@ export default function AdminProductsPage() {
             <div className="rounded-2xl bg-[#159A68]/10 border border-[#159A68]/25 p-4 flex items-center gap-3 text-xs text-[#159A68]">
               <CheckCircle2 className="w-4 h-4 shrink-0" />
               <span className="font-semibold">
-                Tidak ada peringatan kedaluwarsa yang belum ditangani saat ini.
-                Semua stok batch dalam kondisi terpantau.
+                {showResolvedAlerts
+                  ? 'Belum ada riwayat peringatan yang selesai ditangani.'
+                  : 'Tidak ada peringatan kedaluwarsa aktif.'}
               </span>
             </div>
           ) : (
@@ -813,9 +961,10 @@ export default function AdminProductsPage() {
                 const isClearanceAlert = alertItem.pesan
                   .toUpperCase()
                   .includes('CLEARANCE');
+                const uniqueAlertKey = `${alertItem.idProdBatch}-${alertItem.idAlert}`;
                 return (
                   <div
-                    key={alertItem.idAlert}
+                    key={uniqueAlertKey}
                     className={`rounded-2xl p-3.5 border flex flex-col lg:flex-row lg:items-center justify-between gap-3 ${
                       alertItem.isResolved
                         ? 'bg-[#F8FAFF] border-[#E6E8F0] opacity-70'
@@ -945,402 +1094,6 @@ export default function AdminProductsPage() {
           </div>
         )}
 
-        {/* Form Tambah / Edit Batch FEFO */}
-        {isBatchFormOpen && (
-          <section className="mb-6 ff-card p-6 border-2 border-[#F75C03] bg-white">
-            <div className="flex items-center justify-between pb-4 mb-5 border-b border-[#E6E8F0]">
-              <div>
-                <h2 className="font-heading text-base font-extrabold text-[#171725]">
-                  {editingBatch
-                    ? `Edit Batch FEFO: ${editingBatch.idProdBatch}`
-                    : 'Tambah Stok Batch FEFO Baru'}
-                </h2>
-                <p className="text-xs text-[#77788A]">
-                  {editingBatch ? (
-                    <>
-                      Perbarui stok fisik awal, sisa stok online, tanggal
-                      kedaluwarsa, harga override, atau diskon batch (
-                      <code>
-                        PUT /api/inventory/batches/{editingBatch.idProdBatch}
-                      </code>
-                      )
-                    </>
-                  ) : (
-                    <>
-                      Stok online produk dihitung otomatis dari akumulasi batch
-                      aktif yang belum kedaluwarsa (
-                      <code>POST /api/inventory/batches</code>)
-                    </>
-                  )}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={handleCloseBatchForm}
-                className="text-[#77788A] hover:text-[#171725] cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <form
-              onSubmit={handleSubmitBatch(onSubmitBatchForm)}
-              noValidate
-              className="space-y-4"
-            >
-              <div
-                className={`grid grid-cols-1 ${
-                  editingBatch ? 'sm:grid-cols-4' : 'sm:grid-cols-3'
-                } gap-4`}
-              >
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Pilih Produk *
-                  </label>
-                  <select
-                    {...registerBatch('productId')}
-                    disabled={Boolean(editingBatch)}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] bg-white disabled:bg-[#F1F3F8] disabled:text-[#77788A] focus:border-[#4737FF] focus:outline-none"
-                  >
-                    <option value="">-- Pilih Produk --</option>
-                    {products.map((p) => (
-                      <option key={p.idProduk} value={p.idProduk}>
-                        [{p.idProduk}] {p.namaProduk}
-                      </option>
-                    ))}
-                  </select>
-                  {batchErrors.productId && (
-                    <p className="mt-1 text-xs text-[#E5484D]">
-                      {batchErrors.productId.message}
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    {editingBatch
-                      ? 'Stok Awal (Unit) *'
-                      : 'Jumlah Stok Masuk (Unit, ≥ 1) *'}
-                  </label>
-                  <input
-                    type="number"
-                    min={editingBatch ? 0 : 1}
-                    {...registerBatch('stokAwal')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                  {batchErrors.stokAwal && (
-                    <p className="mt-1 text-xs text-[#E5484D]">
-                      {batchErrors.stokAwal.message}
-                    </p>
-                  )}
-                </div>
-
-                {editingBatch && (
-                  <div>
-                    <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                      Sisa Stok Online (Unit) *
-                    </label>
-                    <input
-                      type="number"
-                      min={0}
-                      {...registerBatch('stokOnline')}
-                      className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                    />
-                    {batchErrors.stokOnline && (
-                      <p className="mt-1 text-xs text-[#E5484D]">
-                        {batchErrors.stokOnline.message}
-                      </p>
-                    )}
-                  </div>
-                )}
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Tanggal Kedaluwarsa *
-                  </label>
-                  <input
-                    type="date"
-                    min={editingBatch ? undefined : minExpDate || undefined}
-                    {...registerBatch('tanggalExp')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                  {batchErrors.tanggalExp && (
-                    <p className="mt-1 text-xs text-[#E5484D]">
-                      {batchErrors.tanggalExp.message}
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Harga Override Khusus Batch Ini (Rp, Opsional)
-                  </label>
-                  <input
-                    type="number"
-                    step="any"
-                    placeholder="Kosongkan jika menggunakan harga eceran produk"
-                    {...registerBatch('hargaOverride')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Diskon Clearance Batch (%, Opsional)
-                  </label>
-                  <input
-                    type="number"
-                    step="any"
-                    min={0}
-                    max={100}
-                    placeholder="Contoh: 15 (untuk diskon 15%)"
-                    {...registerBatch('diskon')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                </div>
-              </div>
-
-              <div className="flex items-center justify-end gap-2.5 pt-2">
-                <button
-                  type="button"
-                  onClick={handleCloseBatchForm}
-                  className="px-4 py-2.5 rounded-xl border border-[#E6E8F0] bg-white hover:bg-[#F1F3F8] text-[#171725] text-xs font-semibold cursor-pointer"
-                >
-                  Batal
-                </button>
-                <button
-                  type="submit"
-                  disabled={isSubmittingBatch}
-                  className="px-5 py-2.5 rounded-xl bg-[#F75C03] hover:bg-[#D94800] disabled:opacity-50 text-white text-xs font-bold cursor-pointer"
-                >
-                  {isSubmittingBatch
-                    ? 'Menyimpan Batch...'
-                    : editingBatch
-                      ? 'Simpan Perubahan Batch'
-                      : 'Simpan Batch Stok FEFO'}
-                </button>
-              </div>
-            </form>
-          </section>
-        )}
-
-        {/* Form Tambah / Edit Produk */}
-        {isFormOpen && (
-          <section className="mb-6 ff-card p-6 border-2 border-[#4737FF] bg-white">
-            <div className="flex items-center justify-between pb-4 mb-5 border-b border-[#E6E8F0]">
-              <div>
-                <h2 className="font-heading text-base font-extrabold text-[#171725]">
-                  {editingProduct
-                    ? `Edit Produk: ${editingProduct.namaProduk}`
-                    : 'Tambah Produk Baru'}
-                </h2>
-                <p className="text-xs text-[#77788A]">
-                  Lengkapi spesifikasi produk frozen food sesuai kontrak DTO
-                  backend
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={handleCloseForm}
-                className="text-[#77788A] hover:text-[#171725] cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <form
-              onSubmit={handleSubmit(onSubmitForm)}
-              noValidate
-              className="space-y-4"
-            >
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Nama Produk *
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="Contoh: Nugget Ayam Crispy 500g"
-                    {...register('namaProduk')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                  {errors.namaProduk && (
-                    <p className="mt-1 text-xs text-[#E5484D]">
-                      {errors.namaProduk.message}
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Kategori *
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="Contoh: Olahan Ayam, Dimsum, Sosis..."
-                    {...register('kategori')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                  {errors.kategori && (
-                    <p className="mt-1 text-xs text-[#E5484D]">
-                      {errors.kategori.message}
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Harga Eceran (Rp, &gt; 0) *
-                  </label>
-                  <input
-                    type="number"
-                    step="any"
-                    {...register('hargaEceran')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                  {errors.hargaEceran && (
-                    <p className="mt-1 text-xs text-[#E5484D]">
-                      {errors.hargaEceran.message}
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Harga Beli (Rp, &ge; 0) *
-                  </label>
-                  <input
-                    type="number"
-                    min={0}
-                    step="any"
-                    {...register('hargaBeli')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                  {errors.hargaBeli && (
-                    <p className="mt-1 text-xs text-[#E5484D]">
-                      {errors.hargaBeli.message}
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Keuntungan (Rp)
-                  </label>
-                  <input
-                    type="text"
-                    readOnly
-                    disabled
-                    value={formatRupiah(keuntunganForm)}
-                    className={`w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm bg-[#F1F3F8] font-semibold focus:outline-none ${
-                      keuntunganForm < 0 ? 'text-red-600' : 'text-emerald-600'
-                    }`}
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Berat (gram, &gt; 0) *
-                  </label>
-                  <input
-                    type="number"
-                    step="any"
-                    placeholder="Contoh: 500 (untuk 500g)"
-                    {...register('berat')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                  {errors.berat && (
-                    <p className="mt-1 text-xs text-[#E5484D]">
-                      {errors.berat.message}
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    Volume (ml/cm³, &ge; 0)
-                  </label>
-                  <input
-                    type="number"
-                    step="any"
-                    {...register('volume')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                  {errors.volume && (
-                    <p className="mt-1 text-xs text-[#E5484D]">
-                      {errors.volume.message}
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                    URL Gambar Produk (Opsional)
-                  </label>
-                  <input
-                    type="url"
-                    placeholder="https://images.unsplash.com/..."
-                    {...register('gambar')}
-                    className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                  />
-                </div>
-
-                <div className="flex items-end pb-2">
-                  <label className="inline-flex items-center gap-2.5 text-xs font-semibold text-[#171725] cursor-pointer">
-                    <input
-                      type="checkbox"
-                      {...register('isActive')}
-                      className="w-4 h-4 rounded accent-[#4737FF]"
-                    />
-                    <span>Produk Aktif (Ditampilkan di Katalog)</span>
-                  </label>
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-[#171725] mb-1.5">
-                  Deskripsi Produk (Opsional)
-                </label>
-                <textarea
-                  rows={2}
-                  placeholder="Deskripsi singkat komposisi atau saran penyajian..."
-                  {...register('deskripsiProduk')}
-                  className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
-                />
-              </div>
-
-              <div className="flex items-center justify-end gap-2.5 pt-2">
-                <button
-                  type="button"
-                  onClick={handleCloseForm}
-                  className="px-4 py-2.5 rounded-xl border border-[#E6E8F0] bg-white hover:bg-[#F1F3F8] text-[#171725] text-xs font-semibold cursor-pointer"
-                >
-                  Batal
-                </button>
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="px-5 py-2.5 rounded-xl bg-[#4737FF] hover:bg-[#3529BF] disabled:opacity-50 text-white text-xs font-bold cursor-pointer"
-                >
-                  {isSubmitting
-                    ? 'Menyimpan...'
-                    : editingProduct
-                      ? 'Simpan Perubahan'
-                      : 'Tambah Produk'}
-                </button>
-              </div>
-            </form>
-          </section>
-        )}
-
         {/* Tabel Daftar Katalog Produk */}
         <section className="ff-card p-6 bg-white mb-8">
           <div className="flex flex-col space-y-4 pb-4 mb-4 border-b border-[#E6E8F0]">
@@ -1408,6 +1161,10 @@ export default function AdminProductsPage() {
                     { key: 'AVAILABLE', label: 'Stok Tersedia' },
                     { key: 'PROMO', label: 'Sedang Promo / Tiering' },
                     { key: 'OUT_OF_STOCK', label: 'Stok Habis (0)' },
+                    {
+                      key: 'INACTIVE',
+                      label: `Nonaktif (${products.filter((p) => p.isActive === false).length})`,
+                    },
                   ] as const
                 ).map((item) => {
                   const isActive = productStatusFilter === item.key;
@@ -1953,6 +1710,476 @@ export default function AdminProductsPage() {
             )}
         </section>
 
+        {/* Slide-over Drawer (Panel Kanan) Tambah / Edit Produk */}
+        <div
+          role="dialog"
+          aria-modal={isFormOpen}
+          aria-hidden={!isFormOpen}
+          onClick={handleCloseForm}
+          className={`fixed inset-0 z-50 bg-slate-900/30 flex justify-end transition-opacity duration-300 ease-in-out ${
+            isFormOpen
+              ? 'opacity-100 pointer-events-auto'
+              : 'opacity-0 pointer-events-none'
+          }`}
+        >
+          <form
+            onSubmit={handleSubmit(onSubmitForm)}
+            noValidate
+            onClick={(e) => e.stopPropagation()}
+            className={`bg-white w-full max-w-xl h-full shadow-2xl flex flex-col justify-between overflow-hidden transform transition-transform duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] ${
+              isFormOpen ? 'translate-x-0' : 'translate-x-full'
+            }`}
+          >
+            {/* Sticky Header Drawer */}
+            <div className="p-6 border-b border-slate-100 flex items-start justify-between">
+              <div>
+                <h2 className="font-heading text-base font-extrabold text-[#171725]">
+                  {editingProduct
+                    ? `Edit Produk: ${editingProduct.namaProduk}`
+                    : 'Tambah Produk Baru'}
+                </h2>
+                <p className="text-xs text-[#77788A] mt-0.5">
+                  Lengkapi spesifikasi produk frozen food sesuai kontrak DTO
+                  backend
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleCloseForm}
+                aria-label="Tutup drawer produk"
+                className="cursor-pointer p-2 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors duration-150 shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Scrollable Body Drawer */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-start">
+                <div className="flex flex-col">
+                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
+                    Nama Produk *
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Contoh: Nugget Ayam Crispy 500g"
+                    {...register('namaProduk')}
+                    className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none ${
+                      errors.namaProduk
+                        ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                        : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                    }`}
+                  />
+                  {errors.namaProduk && (
+                    <p className="text-xs text-red-500 mt-1.5">
+                      {errors.namaProduk.message}
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex flex-col">
+                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
+                    Kategori *
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Contoh: Olahan Ayam, Dimsum, Sosis..."
+                    {...register('kategori')}
+                    className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none ${
+                      errors.kategori
+                        ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                        : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                    }`}
+                  />
+                  {errors.kategori && (
+                    <p className="text-xs text-red-500 mt-1.5">
+                      {errors.kategori.message}
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-start">
+                <div className="flex flex-col">
+                  <label className="min-h-[36px] flex items-end pb-1 text-xs font-semibold text-[#171725] mb-1">
+                    Harga Eceran (Rp, &gt; 0) *
+                  </label>
+                  <input
+                    type="number"
+                    step="any"
+                    {...register('hargaEceran')}
+                    className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none ${
+                      errors.hargaEceran
+                        ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                        : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                    }`}
+                  />
+                  {errors.hargaEceran && (
+                    <p className="text-xs text-red-500 mt-1.5">
+                      {errors.hargaEceran.message}
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex flex-col">
+                  <label className="min-h-[36px] flex items-end pb-1 text-xs font-semibold text-[#171725] mb-1">
+                    Harga Beli (Rp, &ge; 0) *
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="any"
+                    {...register('hargaBeli')}
+                    className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none ${
+                      errors.hargaBeli
+                        ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                        : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                    }`}
+                  />
+                  {errors.hargaBeli && (
+                    <p className="text-xs text-red-500 mt-1.5">
+                      {errors.hargaBeli.message}
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex flex-col">
+                  <label className="min-h-[36px] flex items-end pb-1 text-xs font-semibold text-[#171725] mb-1">
+                    Keuntungan (Rp)
+                  </label>
+                  <input
+                    type="text"
+                    readOnly
+                    disabled
+                    value={formatRupiah(keuntunganForm)}
+                    className={`h-11 w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm bg-[#F1F3F8] font-semibold focus:outline-none ${
+                      keuntunganForm < 0 ? 'text-red-600' : 'text-emerald-600'
+                    }`}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-start">
+                <div className="flex flex-col">
+                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
+                    Berat (gram, &gt; 0) *
+                  </label>
+                  <input
+                    type="number"
+                    step="any"
+                    placeholder="Contoh: 500 (untuk 500g)"
+                    {...register('berat')}
+                    className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none ${
+                      errors.berat
+                        ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                        : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                    }`}
+                  />
+                  {errors.berat && (
+                    <p className="text-xs text-red-500 mt-1.5">
+                      {errors.berat.message}
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex flex-col">
+                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
+                    Volume (ml/cm³, &ge; 0)
+                  </label>
+                  <input
+                    type="number"
+                    step="any"
+                    {...register('volume')}
+                    className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none ${
+                      errors.volume
+                        ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                        : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                    }`}
+                  />
+                  {errors.volume && (
+                    <p className="text-xs text-red-500 mt-1.5">
+                      {errors.volume.message}
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-start">
+                <div className="flex flex-col">
+                  <label className="block text-xs font-semibold text-[#171725] mb-1.5">
+                    URL Gambar Produk (Opsional)
+                  </label>
+                  <input
+                    type="url"
+                    placeholder="https://images.unsplash.com/..."
+                    {...register('gambar')}
+                    className="h-11 w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
+                  />
+                </div>
+
+                <div className="flex flex-col sm:pt-[22px]">
+                  <label className="h-11 inline-flex items-center gap-2.5 text-xs font-semibold text-[#171725] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      {...register('isActive')}
+                      className="w-4 h-4 rounded accent-[#4737FF]"
+                    />
+                    <span>Produk Aktif (Ditampilkan di Katalog)</span>
+                  </label>
+                </div>
+              </div>
+
+              <div className="flex flex-col">
+                <label className="block text-xs font-semibold text-[#171725] mb-1.5">
+                  Deskripsi Produk (Opsional)
+                </label>
+                <textarea
+                  rows={3}
+                  placeholder="Deskripsi singkat komposisi atau saran penyajian..."
+                  {...register('deskripsiProduk')}
+                  className="w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
+                />
+              </div>
+            </div>
+
+            {/* Sticky Footer Drawer */}
+            <div className="p-6 border-t border-slate-100 bg-slate-50/50 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={handleCloseForm}
+                className="px-4 py-2.5 rounded-xl text-xs font-semibold cursor-pointer border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 hover:text-slate-900 hover:border-slate-300 active:scale-[0.98] transition-all duration-150"
+              >
+                Batal
+              </button>
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="px-5 py-2.5 rounded-xl bg-[#4737FF] hover:bg-[#3529BF] disabled:opacity-50 text-white text-xs font-bold cursor-pointer transition-colors duration-150"
+              >
+                {isSubmitting
+                  ? 'Menyimpan...'
+                  : editingProduct
+                    ? 'Simpan Perubahan'
+                    : 'Tambah Produk'}
+              </button>
+            </div>
+          </form>
+        </div>
+
+        {/* Slide-over Drawer (Panel Kanan) Tambah / Edit Batch FEFO */}
+        <div
+          role="dialog"
+          aria-modal={isBatchFormOpen}
+          aria-hidden={!isBatchFormOpen}
+          onClick={handleCloseBatchForm}
+          className={`fixed inset-0 z-50 bg-slate-900/30 flex justify-end transition-opacity duration-300 ease-in-out ${
+            isBatchFormOpen
+              ? 'opacity-100 pointer-events-auto'
+              : 'opacity-0 pointer-events-none'
+          }`}
+        >
+          <form
+            onSubmit={handleSubmitBatch(onSubmitBatchForm)}
+            noValidate
+            onClick={(e) => e.stopPropagation()}
+            className={`bg-white w-full max-w-xl h-full shadow-2xl flex flex-col justify-between overflow-hidden transform transition-transform duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] ${
+              isBatchFormOpen ? 'translate-x-0' : 'translate-x-full'
+            }`}
+          >
+            {/* Sticky Header Drawer */}
+            <div className="p-6 border-b border-slate-100 flex items-start justify-between">
+              <div>
+                <h2 className="font-heading text-base font-extrabold text-[#171725]">
+                  {editingBatch
+                    ? `Edit Batch FEFO: ${editingBatch.idProdBatch}`
+                    : 'Tambah Stok Batch FEFO Baru'}
+                </h2>
+                <p className="text-xs text-[#77788A] mt-0.5">
+                  {editingBatch ? (
+                    <>
+                      Perbarui stok fisik awal, sisa stok online, tanggal
+                      kedaluwarsa, harga override, atau diskon batch (
+                      <code>
+                        PUT /api/inventory/batches/{editingBatch.idProdBatch}
+                      </code>
+                      )
+                    </>
+                  ) : (
+                    <>
+                      Stok online produk dihitung otomatis dari akumulasi batch
+                      aktif yang belum kedaluwarsa (
+                      <code>POST /api/inventory/batches</code>)
+                    </>
+                  )}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleCloseBatchForm}
+                aria-label="Tutup drawer batch"
+                className="cursor-pointer p-2 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors duration-150 shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Scrollable Body Drawer */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-5">
+              <div className="flex flex-col">
+                <label className="block text-xs font-semibold text-[#171725] mb-1.5">
+                  Pilih Produk *
+                </label>
+                <select
+                  {...registerBatch('productId')}
+                  disabled={Boolean(editingBatch)}
+                  className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] bg-white disabled:bg-[#F1F3F8] disabled:text-[#77788A] focus:outline-none ${
+                    batchErrors.productId
+                      ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                      : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                  }`}
+                >
+                  <option value="">-- Pilih Produk --</option>
+                  {products.map((p) => (
+                    <option key={p.idProduk} value={p.idProduk}>
+                      [{p.idProduk}] {p.namaProduk}
+                    </option>
+                  ))}
+                </select>
+                {batchErrors.productId && (
+                  <p className="text-xs text-red-500 mt-1.5">
+                    {batchErrors.productId.message}
+                  </p>
+                )}
+              </div>
+
+              <div
+                className={`grid grid-cols-1 ${
+                  editingBatch ? 'sm:grid-cols-3' : 'sm:grid-cols-2'
+                } gap-4 items-start`}
+              >
+                <div className="flex flex-col">
+                  <label className="min-h-[36px] flex items-end pb-1 text-xs font-semibold text-[#171725] mb-1">
+                    {editingBatch
+                      ? 'Stok Awal (Unit) *'
+                      : 'Jumlah Stok Masuk (Unit, ≥ 1) *'}
+                  </label>
+                  <input
+                    type="number"
+                    min={editingBatch ? 0 : 1}
+                    {...registerBatch('stokAwal')}
+                    className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none ${
+                      batchErrors.stokAwal
+                        ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                        : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                    }`}
+                  />
+                  {batchErrors.stokAwal && (
+                    <p className="text-xs text-red-500 mt-1.5">
+                      {batchErrors.stokAwal.message}
+                    </p>
+                  )}
+                </div>
+
+                {editingBatch && (
+                  <div className="flex flex-col">
+                    <label className="min-h-[36px] flex items-end pb-1 text-xs font-semibold text-[#171725] mb-1">
+                      Sisa Stok Online (Unit) *
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      {...registerBatch('stokOnline')}
+                      className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none ${
+                        batchErrors.stokOnline
+                          ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                          : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                      }`}
+                    />
+                    {batchErrors.stokOnline && (
+                      <p className="text-xs text-red-500 mt-1.5">
+                        {batchErrors.stokOnline.message}
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex flex-col">
+                  <label className="min-h-[36px] flex items-end pb-1 text-xs font-semibold text-[#171725] mb-1">
+                    Tanggal Kedaluwarsa *
+                  </label>
+                  <input
+                    type="date"
+                    min={editingBatch ? undefined : minExpDate || undefined}
+                    {...registerBatch('tanggalExp')}
+                    className={`h-11 w-full rounded-xl border px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none ${
+                      batchErrors.tanggalExp
+                        ? 'border-red-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
+                        : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                    }`}
+                  />
+                  {batchErrors.tanggalExp && (
+                    <p className="text-xs text-red-500 mt-1.5">
+                      {batchErrors.tanggalExp.message}
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-start">
+                <div className="flex flex-col">
+                  <label className="min-h-[36px] flex items-end pb-1 text-xs font-semibold text-[#171725] mb-1">
+                    Harga Override Khusus Batch Ini (Rp, Opsional)
+                  </label>
+                  <input
+                    type="number"
+                    step="any"
+                    placeholder="Kosongkan jika menggunakan harga eceran produk"
+                    {...registerBatch('hargaOverride')}
+                    className="h-11 w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
+                  />
+                </div>
+
+                <div className="flex flex-col">
+                  <label className="min-h-[36px] flex items-end pb-1 text-xs font-semibold text-[#171725] mb-1">
+                    Diskon Clearance Batch (%, Opsional)
+                  </label>
+                  <input
+                    type="number"
+                    step="any"
+                    min={0}
+                    max={100}
+                    placeholder="Contoh: 15 (untuk diskon 15%)"
+                    {...registerBatch('diskon')}
+                    className="h-11 w-full rounded-xl border border-[#E6E8F0] px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Sticky Footer Drawer */}
+            <div className="p-6 border-t border-slate-100 bg-slate-50/50 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={handleCloseBatchForm}
+                className="px-4 py-2.5 rounded-xl text-xs font-semibold cursor-pointer border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 hover:text-slate-900 hover:border-slate-300 active:scale-[0.98] transition-all duration-150"
+              >
+                Batal
+              </button>
+              <button
+                type="submit"
+                disabled={isSubmittingBatch}
+                className="px-5 py-2.5 rounded-xl bg-[#F75C03] hover:bg-[#D94800] disabled:opacity-50 text-white text-xs font-bold cursor-pointer transition-colors duration-150"
+              >
+                {isSubmittingBatch
+                  ? 'Menyimpan Batch...'
+                  : editingBatch
+                    ? 'Simpan Perubahan Batch'
+                    : 'Simpan Batch Stok FEFO'}
+              </button>
+            </div>
+          </form>
+        </div>
+
         {/* Modal Konfirmasi Hapus Batch */}
         {deleteBatchTarget && (
           <div
@@ -1982,7 +2209,7 @@ export default function AdminProductsPage() {
                   type="button"
                   disabled={isDeletingBatch}
                   onClick={() => setDeleteBatchTarget(null)}
-                  className="px-4 py-2.5 rounded-xl border border-[#E6E8F0] bg-white hover:bg-[#F1F3F8] text-[#171725] text-xs font-semibold cursor-pointer"
+                  className="px-4 py-2.5 rounded-xl text-xs font-semibold cursor-pointer border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 hover:text-slate-900 hover:border-slate-300 active:scale-[0.98] transition-all duration-150"
                 >
                   Batal
                 </button>
@@ -2028,7 +2255,7 @@ export default function AdminProductsPage() {
                   type="button"
                   disabled={isDeleting}
                   onClick={() => setDeleteTarget(null)}
-                  className="px-4 py-2.5 rounded-xl border border-[#E6E8F0] bg-white hover:bg-[#F1F3F8] text-[#171725] text-xs font-semibold cursor-pointer"
+                  className="px-4 py-2.5 rounded-xl text-xs font-semibold cursor-pointer border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 hover:text-slate-900 hover:border-slate-300 active:scale-[0.98] transition-all duration-150"
                 >
                   Batal
                 </button>
@@ -2045,42 +2272,57 @@ export default function AdminProductsPage() {
           </div>
         )}
 
-        {/* Modal Kelola Harga Grosir Bertingkat (TieringPrice) */}
-        {tieringTargetProduct && (
-          <div
-            role="dialog"
-            aria-modal="true"
-            className="fixed inset-0 z-50 flex items-center justify-center bg-[#101018]/60 backdrop-blur-xs p-4"
+        {/* Slide-over Drawer (Panel Kanan) Kelola Harga Grosir Bertingkat (TieringPrice) */}
+        <div
+          role="dialog"
+          aria-modal={Boolean(tieringTargetProduct)}
+          aria-hidden={!tieringTargetProduct}
+          onClick={() => setTieringTargetProduct(null)}
+          className={`fixed inset-0 z-50 bg-slate-900/30 flex justify-end transition-opacity duration-300 ease-in-out ${
+            tieringTargetProduct
+              ? 'opacity-100 pointer-events-auto'
+              : 'opacity-0 pointer-events-none'
+          }`}
+        >
+          <form
+            onSubmit={handleAddTieringRule}
+            onClick={(e) => e.stopPropagation()}
+            className={`bg-white w-full max-w-xl h-full shadow-2xl flex flex-col justify-between overflow-hidden transform transition-transform duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] ${
+              tieringTargetProduct ? 'translate-x-0' : 'translate-x-full'
+            }`}
           >
-            <div className="bg-white rounded-3xl p-6 max-w-lg w-full border border-[#E6E8F0] shadow-xl space-y-4">
-              <div className="flex items-start justify-between gap-3 pb-3 border-b border-[#E6E8F0]">
-                <div>
-                  <h3 className="font-heading text-base font-extrabold text-[#171725]">
-                    Kelola Harga Grosir (Tiering):{' '}
-                    {tieringTargetProduct.namaProduk}
-                  </h3>
-                  <p className="text-xs text-[#77788A] mt-0.5">
-                    Harga Eceran Normal:{' '}
-                    <strong>
-                      {formatRupiah(tieringTargetProduct.hargaEceran)}
-                    </strong>{' '}
-                    • Berlaku otomatis di Keranjang, Checkout &amp; Nota PDF
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setTieringTargetProduct(null)}
-                  className="text-[#77788A] hover:text-[#171725] cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
+            {/* Sticky Header Drawer */}
+            <div className="p-6 border-b border-slate-100 flex items-start justify-between">
+              <div>
+                <h3 className="font-heading text-base font-extrabold text-[#171725]">
+                  Kelola Harga Grosir (Tiering):{' '}
+                  {tieringTargetProduct?.namaProduk || ''}
+                </h3>
+                <p className="text-xs text-[#77788A] mt-0.5">
+                  Harga Eceran Normal:{' '}
+                  <strong>
+                    {formatRupiah(tieringTargetProduct?.hargaEceran || 0)}
+                  </strong>{' '}
+                  • Berlaku otomatis di Keranjang, Checkout &amp; Nota PDF
+                </p>
               </div>
+              <button
+                type="button"
+                onClick={() => setTieringTargetProduct(null)}
+                aria-label="Tutup drawer tiering"
+                className="cursor-pointer p-2 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors duration-150 shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
 
+            {/* Scrollable Body Drawer */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-5">
               <div className="space-y-2">
                 <p className="text-xs font-bold text-[#171725]">
                   Daftar Aturan Tiering Aktif:
                 </p>
-                {!tieringTargetProduct.tieringPrices ||
+                {!tieringTargetProduct?.tieringPrices ||
                 tieringTargetProduct.tieringPrices.length === 0 ? (
                   <p className="text-xs text-[#77788A] bg-[#F8FAFF] rounded-xl p-3 border border-[#E6E8F0]">
                     Belum ada aturan harga grosir untuk produk ini.
@@ -2113,16 +2355,13 @@ export default function AdminProductsPage() {
                 )}
               </div>
 
-              <form
-                onSubmit={handleAddTieringRule}
-                className="pt-3 border-t border-[#E6E8F0] space-y-3"
-              >
+              <div className="pt-4 border-t border-slate-100 space-y-3">
                 <p className="text-xs font-bold text-[#171725]">
                   Tambah Rentang Kuantitas Baru:
                 </p>
-                <div className="grid grid-cols-3 gap-3">
-                  <div>
-                    <label className="block text-[11px] font-semibold text-[#5E5E6A] mb-1">
+                <div className="grid grid-cols-3 gap-3 items-start">
+                  <div className="flex flex-col">
+                    <label className="min-h-[36px] flex items-end pb-1 text-[11px] font-semibold text-[#5E5E6A] mb-1">
                       Min. Qty *
                     </label>
                     <input
@@ -2131,11 +2370,11 @@ export default function AdminProductsPage() {
                       required
                       value={tierMinQty}
                       onChange={(e) => setTierMinQty(e.target.value)}
-                      className="w-full rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725]"
+                      className="h-11 w-full rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725] focus:border-[#4737FF] focus:outline-none"
                     />
                   </div>
-                  <div>
-                    <label className="block text-[11px] font-semibold text-[#5E5E6A] mb-1">
+                  <div className="flex flex-col">
+                    <label className="min-h-[36px] flex items-end pb-1 text-[11px] font-semibold text-[#5E5E6A] mb-1">
                       Maks. Qty *
                     </label>
                     <input
@@ -2144,11 +2383,11 @@ export default function AdminProductsPage() {
                       required
                       value={tierMaxQty}
                       onChange={(e) => setTierMaxQty(e.target.value)}
-                      className="w-full rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725]"
+                      className="h-11 w-full rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725] focus:border-[#4737FF] focus:outline-none"
                     />
                   </div>
-                  <div>
-                    <label className="block text-[11px] font-semibold text-[#5E5E6A] mb-1">
+                  <div className="flex flex-col">
+                    <label className="min-h-[36px] flex items-end pb-1 text-[11px] font-semibold text-[#5E5E6A] mb-1">
                       Harga / Unit (Rp) *
                     </label>
                     <input
@@ -2157,31 +2396,32 @@ export default function AdminProductsPage() {
                       required
                       value={tierHargaUnit}
                       onChange={(e) => setTierHargaUnit(e.target.value)}
-                      className="w-full rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725]"
+                      className="h-11 w-full rounded-xl border border-[#E6E8F0] px-3 py-2 text-xs text-[#171725] focus:border-[#4737FF] focus:outline-none"
                     />
                   </div>
                 </div>
-
-                <div className="flex items-center justify-end gap-2 pt-2">
-                  <button
-                    type="button"
-                    onClick={() => setTieringTargetProduct(null)}
-                    className="px-4 py-2 rounded-xl border border-[#E6E8F0] text-xs font-semibold text-[#171725] cursor-pointer"
-                  >
-                    Tutup
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={isSavingTier}
-                    className="px-4 py-2 rounded-xl bg-[#4737FF] hover:bg-[#3529BF] disabled:opacity-50 text-white text-xs font-bold cursor-pointer"
-                  >
-                    {isSavingTier ? 'Menyimpan...' : '+ Tambah Aturan Tiering'}
-                  </button>
-                </div>
-              </form>
+              </div>
             </div>
-          </div>
-        )}
+
+            {/* Sticky Footer Drawer */}
+            <div className="p-6 border-t border-slate-100 bg-slate-50/50 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setTieringTargetProduct(null)}
+                className="px-4 py-2.5 rounded-xl text-xs font-semibold cursor-pointer border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 hover:text-slate-900 hover:border-slate-300 active:scale-[0.98] transition-all duration-150"
+              >
+                Tutup
+              </button>
+              <button
+                type="submit"
+                disabled={isSavingTier}
+                className="px-5 py-2.5 rounded-xl bg-[#4737FF] hover:bg-[#3529BF] disabled:opacity-50 text-white text-xs font-bold cursor-pointer transition-colors duration-150"
+              >
+                {isSavingTier ? 'Menyimpan...' : '+ Tambah Aturan Tiering'}
+              </button>
+            </div>
+          </form>
+        </div>
       </main>
     </div>
   );
