@@ -323,6 +323,48 @@ export function formatDateTimeId(raw?: string | null): string {
   return formatWaktuSingkat(raw);
 }
 
+/**
+ * Memformat jam WIB dengan membandingkan tanggal terhadap waktu referensi
+ * (mis. berangkatPerkiraan).
+ * - Hari sama: "23.45 WIB"
+ * - Beda hari (melewati tengah malam): "23 Nov 00.16 WIB"
+ * Deterministik tanpa new Date() agar aman untuk Next.js cacheComponents.
+ */
+export function formatJamRelatifWib(
+  raw?: string | null,
+  referensiRaw?: string | null
+): string {
+  if (!raw) return '-';
+  const trimmed = raw.trim();
+  const isoMatch = trimmed.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})/
+  );
+  if (isoMatch) {
+    const [, year, monthStr, dayStr, hour, minute] = isoMatch;
+    const ymd = `${year}-${monthStr}-${dayStr}`;
+    const refMatch = referensiRaw
+      ?.trim()
+      .match(/^(\d{4})-(\d{2})-(\d{2})/);
+    const refYmd = refMatch
+      ? `${refMatch[1]}-${refMatch[2]}-${refMatch[3]}`
+      : null;
+
+    if (refYmd && ymd !== refYmd) {
+      const dayNum = parseInt(dayStr, 10);
+      const monthIdx = parseInt(monthStr, 10) - 1;
+      const monthName = NAMA_BULAN_PENDEK[monthIdx] || monthStr;
+      return `${dayNum} ${monthName} ${hour}.${minute} WIB`;
+    }
+    return `${hour}.${minute} WIB`;
+  }
+
+  const timeMatch = trimmed.match(/(\d{2}):(\d{2})/);
+  if (timeMatch) {
+    return `${timeMatch[1]}.${timeMatch[2]} WIB`;
+  }
+  return formatWaktuSingkat(raw);
+}
+
 export function getErrorMessage(
   error: unknown,
   fallback = 'Terjadi kesalahan pada server.'

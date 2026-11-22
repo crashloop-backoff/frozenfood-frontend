@@ -10,7 +10,6 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import {
   ArrowLeft,
   MapPin,
-  Navigation,
   Truck,
   Snowflake,
   AlertCircle,
@@ -40,6 +39,7 @@ import {
   PaymentResponse,
 } from '@/types/api';
 import ShopSidebar from '@/components/shop/sidebar';
+import { PemilihLokasi } from '@/components/map/pemilih-lokasi';
 
 // 4 Preset Lokasi sesuai Bagian A6
 const DEMO_LOCATIONS = [
@@ -118,7 +118,6 @@ export default function CheckoutPage() {
   const [estimateError, setEstimateError] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [infoNotice, setInfoNotice] = useState<string | null>(null);
-  const [isLocating, setIsLocating] = useState(false);
 
   const [pendingOrder, setPendingOrder] = useState<OrderResponse | null>(null);
 
@@ -145,6 +144,8 @@ export default function CheckoutPage() {
   });
 
   const selectedMetodePay = watch('metodePay');
+  const watchedLat = Number(watch('latitudeTujuan'));
+  const watchedLng = Number(watch('longitudeTujuan'));
 
   const handleSelectDemoLocation = (preset: (typeof DEMO_LOCATIONS)[number]) => {
     if (pendingOrder) return;
@@ -155,36 +156,12 @@ export default function CheckoutPage() {
     setValue('longitudeTujuan', preset.lng, { shouldValidate: true });
   };
 
-  const handleUseCurrentLocation = () => {
+  const handleMapLocationChange = (lat: number, lng: number) => {
     if (pendingOrder) return;
-    if (!navigator.geolocation) {
-      setEstimateError('Browser Anda tidak mendukung fitur Geolocation.');
-      return;
-    }
-    setIsLocating(true);
     setEstimateError(null);
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        setValue(
-          'latitudeTujuan',
-          Number(position.coords.latitude.toFixed(6)),
-          { shouldValidate: true }
-        );
-        setValue(
-          'longitudeTujuan',
-          Number(position.coords.longitude.toFixed(6)),
-          { shouldValidate: true }
-        );
-        setEstimate(null);
-        setIsLocating(false);
-      },
-      () => {
-        setEstimateError(
-          'Gagal mengambil lokasi GPS. Pastikan izin lokasi browser aktif atau gunakan tombol lokasi contoh di bawah.'
-        );
-        setIsLocating(false);
-      }
-    );
+    setEstimate(null);
+    setValue('latitudeTujuan', lat, { shouldValidate: true });
+    setValue('longitudeTujuan', lng, { shouldValidate: true });
   };
 
   const handleCalculateEstimate = async () => {
@@ -524,22 +501,10 @@ export default function CheckoutPage() {
                       </h2>
                       <p className="text-[11px] text-[#77788A]">
                         Alamat diketik sebagai teks, sedangkan perhitungan jarak
-                        sistem mengacu pada titik koordinat
+                        sistem mengacu pada titik pin pada peta
                       </p>
                     </div>
                   </div>
-
-                  <button
-                    type="button"
-                    onClick={handleUseCurrentLocation}
-                    disabled={isLocating || Boolean(pendingOrder)}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#E7EFFF] hover:bg-[#D1CDFF] disabled:opacity-50 text-[#4737FF] text-xs font-bold transition-colors cursor-pointer"
-                  >
-                    <Navigation className="w-3.5 h-3.5" />
-                    <span>
-                      {isLocating ? 'Mengambil GPS...' : 'Gunakan Lokasi Saya'}
-                    </span>
-                  </button>
                 </div>
 
                 {/* Tombol Preset Lokasi Contoh */}
@@ -592,54 +557,27 @@ export default function CheckoutPage() {
                   )}
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label
-                      htmlFor="latitudeTujuan"
-                      className="block text-xs font-semibold text-[#171725] mb-1.5"
-                    >
-                      Latitude Tujuan
-                    </label>
-                    <input
-                      id="latitudeTujuan"
-                      type="number"
-                      step="any"
-                      disabled={Boolean(pendingOrder)}
-                      {...register('latitudeTujuan', {
-                        onChange: () => setEstimate(null),
-                      })}
-                      className="w-full rounded-xl border border-[#E6E8F0] bg-[#F8FAFF] focus:bg-white px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none disabled:bg-[#F1F3F8] transition-colors"
-                    />
-                    {errors.latitudeTujuan && (
-                      <p className="mt-1 text-xs text-[#E5484D]">
-                        {errors.latitudeTujuan.message}
-                      </p>
-                    )}
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="longitudeTujuan"
-                      className="block text-xs font-semibold text-[#171725] mb-1.5"
-                    >
-                      Longitude Tujuan
-                    </label>
-                    <input
-                      id="longitudeTujuan"
-                      type="number"
-                      step="any"
-                      disabled={Boolean(pendingOrder)}
-                      {...register('longitudeTujuan', {
-                        onChange: () => setEstimate(null),
-                      })}
-                      className="w-full rounded-xl border border-[#E6E8F0] bg-[#F8FAFF] focus:bg-white px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none disabled:bg-[#F1F3F8] transition-colors"
-                    />
-                    {errors.longitudeTujuan && (
-                      <p className="mt-1 text-xs text-[#E5484D]">
-                        {errors.longitudeTujuan.message}
-                      </p>
-                    )}
-                  </div>
+                <div>
+                  <PemilihLokasi
+                    latitude={
+                      Number.isFinite(watchedLat)
+                        ? watchedLat
+                        : DEMO_LOCATIONS[0].lat
+                    }
+                    longitude={
+                      Number.isFinite(watchedLng)
+                        ? watchedLng
+                        : DEMO_LOCATIONS[0].lng
+                    }
+                    onChange={handleMapLocationChange}
+                    disabled={Boolean(pendingOrder)}
+                  />
+                  {(errors.latitudeTujuan || errors.longitudeTujuan) && (
+                    <p className="mt-1.5 text-xs text-[#E5484D]">
+                      {errors.latitudeTujuan?.message ||
+                        errors.longitudeTujuan?.message}
+                    </p>
+                  )}
                 </div>
 
                 <button
