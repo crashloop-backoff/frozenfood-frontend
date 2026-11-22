@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
 import {
   Truck,
+  Route,
   RefreshCw,
   AlertCircle,
   CheckCircle2,
@@ -434,14 +435,24 @@ export default function AdminDeliveriesPage() {
             </h1>
           </div>
 
-          <button
-            type="button"
-            onClick={() => refetch()}
-            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white border border-[#E6E8F0] hover:bg-[#F1F3F8] text-[#171725] text-xs font-semibold transition-colors cursor-pointer self-start sm:self-auto shadow-2xs"
-          >
-            <RefreshCw className="w-3.5 h-3.5 text-[#4737FF]" />
-            <span>Muat Ulang Tabel</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+            <Link
+              href="/admin/deliveries/rute"
+              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#4737FF] hover:bg-[#3529BF] text-white text-xs font-bold transition-colors shadow-sm shadow-[#4737FF]/25"
+            >
+              <Route className="w-3.5 h-3.5" />
+              <span>Rute Kurir</span>
+            </Link>
+
+            <button
+              type="button"
+              onClick={() => refetch()}
+              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white border border-[#E6E8F0] hover:bg-[#F1F3F8] text-[#171725] text-xs font-semibold transition-colors cursor-pointer shadow-2xs"
+            >
+              <RefreshCw className="w-3.5 h-3.5 text-[#4737FF]" />
+              <span>Muat Ulang Tabel</span>
+            </button>
+          </div>
         </div>
 
         {/* Notifikasi Suara & Alert Pesanan Masuk / Konfirmasi Ongkir Pihak Ketiga */}

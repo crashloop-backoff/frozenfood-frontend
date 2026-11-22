@@ -28,9 +28,17 @@ api.interceptors.response.use(
       const currentPath = window.location.pathname;
       const isAuthPage =
         currentPath === '/login' || currentPath === '/register';
+      const requestUrl = String(error.config?.url ?? '');
+      const isAuthEndpoint =
+        requestUrl.startsWith('/api/auth/') ||
+        requestUrl === '/api/auth' ||
+        requestUrl.includes('/api/auth/');
+
+      // Kegagalan 401 dari /api/auth/* tidak boleh mengalihkan ke /login
+      const skipRedirect = isAuthPage || (status === 401 && isAuthEndpoint);
 
       // Arahkan ke /login hanya jika 401, atau 403 karena token memang belum ada
-      if ((status === 401 || (status === 403 && !token)) && !isAuthPage) {
+      if ((status === 401 || (status === 403 && !token)) && !skipRedirect) {
         localStorage.removeItem('token');
         window.location.href = '/login';
       }

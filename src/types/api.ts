@@ -238,6 +238,54 @@ export interface DeliveryResponse {
   estimasiTiba: string | null;
   namaPengantar: string | null;
   alasanKeputusan: string | null;
+  latitudeTujuan: number | null;
+  longitudeTujuan: number | null;
+}
+
+export interface KoordinatTitik {
+  latitude: number;
+  longitude: number;
+}
+
+export interface GarisRute {
+  type: 'LineString';
+  coordinates: number[][];
+}
+
+export interface StopKurir {
+  urutan: number;
+  idDelivery: string;
+  idOrder: string;
+  alamatTujuan: string;
+  latitude: number;
+  longitude: number;
+  jarakDariSebelumnyaKm: number;
+  menitDariBerangkat: number;
+  estimasiTiba: string;
+}
+
+export interface PerjalananKurir {
+  perjalananKe: number;
+  berangkatPerkiraan: string;
+  pulangPerkiraan: string;
+  totalJarakKm: number;
+  totalMenit: number;
+  beratMuatanKg: number;
+  volumeMuatanLiter: number;
+  melanggarRantaiDingin: boolean;
+  garisRute: GarisRute | null;
+  stops: StopKurir[];
+}
+
+export interface RuteKurirRequest {
+  idDeliveries: string[];
+}
+
+export interface RuteKurirResponse {
+  toko: KoordinatTitik;
+  sumberRute: 'RUTE_ASLI' | 'PERKIRAAN';
+  perjalanan: PerjalananKurir[];
+  peringatan: string[];
 }
 
 export interface DeliveryListResponse {

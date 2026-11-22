@@ -7,6 +7,7 @@ import {
   Snowflake,
   BarChart3,
   Truck,
+  Route,
   Package,
   Users,
   MessageSquare,
@@ -44,7 +45,15 @@ function AdminSidebarInner() {
       href: '/admin/deliveries',
       label: 'Manajemen Pengiriman',
       icon: Truck,
-      active: pathname.startsWith('/admin/deliveries'),
+      active:
+        pathname.startsWith('/admin/deliveries') &&
+        !pathname.startsWith('/admin/deliveries/rute'),
+    },
+    {
+      href: '/admin/deliveries/rute',
+      label: 'Rute Kurir',
+      icon: Route,
+      active: pathname.startsWith('/admin/deliveries/rute'),
     },
     {
       href: '/admin/products',
