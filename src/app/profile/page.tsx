@@ -32,10 +32,42 @@ import ShopSidebar from '@/components/shop/sidebar';
 import CartPanel from '@/components/shop/cart-panel';
 import { resolveProfileImageUrl } from '@/components/shop/customer-avatar';
 
+const INDONESIAN_PHONE_REGEX = /^08[1-9][0-9]{7,10}$/;
+const PHONE_PREFIX_ERROR =
+  'Nomor telepon wajib diawali 08 (contoh: 081234567890).';
+
+function getPhoneValidationError(phone: string): string {
+  const trimmed = phone.trim();
+  if (!trimmed) {
+    return 'Nomor telepon wajib diisi (contoh: 081234567890).';
+  }
+  if (!trimmed.startsWith('08')) {
+    return PHONE_PREFIX_ERROR;
+  }
+  if (trimmed.length >= 3 && trimmed[2] === '0') {
+    return 'Nomor telepon harus diawali 081–089 (contoh: 081234567890).';
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    return 'Nomor telepon hanya boleh berisi angka (contoh: 081234567890).';
+  }
+  if (trimmed.length < 10 || trimmed.length > 13) {
+    return 'Nomor telepon harus terdiri dari 10–13 digit (contoh: 081234567890).';
+  }
+  return 'Format nomor telepon Indonesia tidak valid (contoh: 081234567890).';
+}
+
 const profileSchema = z.object({
   nama: z.string().min(2, 'Nama lengkap minimal 2 karakter'),
   email: z.string().email('Format email tidak valid'),
-  noTelp: z.string().min(8, 'Nomor telepon minimal 8 digit'),
+  noTelp: z.string().superRefine((val, ctx) => {
+    const trimmed = val.trim();
+    if (!INDONESIAN_PHONE_REGEX.test(trimmed)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: getPhoneValidationError(trimmed),
+      });
+    }
+  }),
   alamat: z.string().min(5, 'Alamat lengkap minimal 5 karakter'),
   passwordBaru: z
     .string()
@@ -86,6 +118,9 @@ export default function CustomerProfilePage() {
     register,
     handleSubmit,
     reset,
+    setValue,
+    setError,
+    clearErrors,
     formState: { errors, isSubmitting },
   } = useForm<ProfileFormValues>({
     resolver: zodResolver(profileSchema),
@@ -97,6 +132,8 @@ export default function CustomerProfilePage() {
       passwordBaru: '',
     },
   });
+
+  const noTelpRegister = register('noTelp');
 
   useEffect(() => {
     if (profile) {
@@ -110,14 +147,86 @@ export default function CustomerProfilePage() {
     }
   }, [profile, reset]);
 
+  const handlePhoneChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    let cleaned = e.target.value.replace(/\D/g, '');
+
+    if (cleaned.startsWith('628')) {
+      cleaned = '08' + cleaned.slice(3);
+    } else if (cleaned.startsWith('8')) {
+      cleaned = '08' + cleaned.slice(1);
+    }
+
+    cleaned = cleaned.slice(0, 13);
+
+    if (e.target.value !== cleaned) {
+      e.target.value = cleaned;
+    }
+
+    setValue('noTelp', cleaned, { shouldDirty: true, shouldValidate: false });
+    setActionSuccess(null);
+
+    if (cleaned.length === 0) {
+      clearErrors('noTelp');
+      return;
+    }
+
+    const isTransitionalPrefix =
+      cleaned === '0' || cleaned === '6' || cleaned === '62';
+
+    if (!cleaned.startsWith('08') && !isTransitionalPrefix) {
+      setError('noTelp', {
+        type: 'manual',
+        message: PHONE_PREFIX_ERROR,
+      });
+      return;
+    }
+
+    if (cleaned.length >= 3 && cleaned[2] === '0') {
+      setError('noTelp', {
+        type: 'manual',
+        message:
+          'Nomor telepon harus diawali 081–089 (contoh: 081234567890).',
+      });
+      return;
+    }
+
+    clearErrors('noTelp');
+  };
+
+  const handlePhoneBlur = (e: React.FocusEvent<HTMLInputElement>) => {
+    noTelpRegister.onBlur(e);
+    const trimmed = e.target.value.trim();
+
+    if (trimmed.length > 0 && !INDONESIAN_PHONE_REGEX.test(trimmed)) {
+      setError('noTelp', {
+        type: 'manual',
+        message: getPhoneValidationError(trimmed),
+      });
+    }
+  };
+
+  const onInvalidProfile = () => {
+    setActionError(null);
+    setActionSuccess(null);
+  };
+
   const onSubmitProfile = async (values: ProfileFormValues) => {
     setActionError(null);
     setActionSuccess(null);
 
+    const trimmedPhone = values.noTelp.trim();
+    if (!INDONESIAN_PHONE_REGEX.test(trimmedPhone)) {
+      setError('noTelp', {
+        type: 'manual',
+        message: getPhoneValidationError(trimmedPhone),
+      });
+      return;
+    }
+
     const payload: CustomerUpdateRequest = {
       nama: values.nama.trim(),
       email: values.email.trim(),
-      noTelp: values.noTelp.trim(),
+      noTelp: trimmedPhone,
       alamat: values.alamat.trim(),
       passwordBaru:
         values.passwordBaru && values.passwordBaru.trim() !== ''
@@ -415,7 +524,7 @@ export default function CustomerProfilePage() {
                   </div>
 
                   <form
-                    onSubmit={handleSubmit(onSubmitProfile)}
+                    onSubmit={handleSubmit(onSubmitProfile, onInvalidProfile)}
                     noValidate
                     className="space-y-4"
                   >
@@ -455,7 +564,7 @@ export default function CustomerProfilePage() {
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-start">
                       <div>
                         <label className="flex items-center gap-1.5 text-xs font-semibold text-[#171725] mb-1.5">
                           <Phone className="w-3.5 h-3.5 text-[#4737FF]" />
@@ -463,8 +572,18 @@ export default function CustomerProfilePage() {
                         </label>
                         <input
                           type="tel"
-                          {...register('noTelp')}
-                          className="w-full rounded-xl border border-[#E6E8F0] bg-[#F8FAFF] focus:bg-white px-3.5 py-2.5 text-sm text-[#171725] focus:border-[#4737FF] focus:outline-none transition-colors"
+                          inputMode="numeric"
+                          maxLength={13}
+                          placeholder="081234567890"
+                          aria-invalid={Boolean(errors.noTelp)}
+                          {...noTelpRegister}
+                          onChange={handlePhoneChange}
+                          onBlur={handlePhoneBlur}
+                          className={`w-full rounded-xl border bg-[#F8FAFF] focus:bg-white px-3.5 py-2.5 text-sm text-[#171725] focus:outline-none transition-colors ${
+                            errors.noTelp
+                              ? 'border-red-400 focus:border-red-500'
+                              : 'border-[#E6E8F0] focus:border-[#4737FF]'
+                          }`}
                         />
                         {errors.noTelp && (
                           <p className="mt-1 text-xs text-[#E5484D]">

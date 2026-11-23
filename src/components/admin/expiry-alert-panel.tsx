@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import Link from 'next/link';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -31,13 +31,74 @@ export interface ExpiryAlertItem {
   createdAt: string;
 }
 
+function deduplicateExpiryAlerts(
+  alerts: ExpiryAlertItem[],
+  resolvedByBatchMap: Record<string, ExpiryAlertItem> = {}
+): ExpiryAlertItem[] {
+  const byAlertId = new Map<string, ExpiryAlertItem>();
+  const byBatchId = new Map<string, ExpiryAlertItem>();
+
+  const combined = [...alerts, ...Object.values(resolvedByBatchMap)];
+
+  for (const item of combined) {
+    if (!item) continue;
+    const alertKey = String(item.idAlert || item.idProdBatch || '').trim();
+    if (!alertKey) continue;
+
+    const batchKey = String(item.idProdBatch || item.idAlert || '').trim();
+    const isKnownResolved = Boolean(
+      item.isResolved ||
+        (batchKey && resolvedByBatchMap[batchKey]?.isResolved) ||
+        (alertKey && resolvedByBatchMap[alertKey]?.isResolved)
+    );
+
+    const normalized: ExpiryAlertItem = {
+      ...item,
+      isResolved: isKnownResolved,
+    };
+
+    const existingByAlert = byAlertId.get(alertKey);
+    if (!existingByAlert) {
+      byAlertId.set(alertKey, normalized);
+    } else if (!existingByAlert.isResolved && normalized.isResolved) {
+      byAlertId.set(alertKey, normalized);
+    }
+  }
+
+  for (const item of byAlertId.values()) {
+    const batchKey = String(item.idProdBatch || item.idAlert || '').trim();
+    if (!batchKey) continue;
+
+    const existingByBatch = byBatchId.get(batchKey);
+    if (!existingByBatch) {
+      byBatchId.set(batchKey, item);
+    } else if (!existingByBatch.isResolved && item.isResolved) {
+      byBatchId.set(batchKey, item);
+    } else if (existingByBatch.isResolved === item.isResolved) {
+      const existingTime = Date.parse(existingByBatch.createdAt || '') || 0;
+      const currentTime = Date.parse(item.createdAt || '') || 0;
+      if (currentTime > existingTime) {
+        byBatchId.set(batchKey, item);
+      }
+    }
+  }
+
+  return Array.from(byBatchId.values());
+}
+
 export default function ExpiryAlertPanel() {
   const queryClient = useQueryClient();
   const [showResolved, setShowResolved] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [resolvedAlertsMap, setResolvedAlertsMap] = useState<
+    Record<string, ExpiryAlertItem>
+  >({});
+  const [sessionResolvedBatchKeys, setSessionResolvedBatchKeys] = useState<
+    Record<string, boolean>
+  >({});
 
   const {
-    data: alerts = [],
+    data: rawAlerts = [],
     isLoading,
     isError,
     error,
@@ -49,17 +110,109 @@ export default function ExpiryAlertPanel() {
       const res = await api.get<ExpiryAlertItem[]>('/api/inventory/alerts', {
         params: { unresolvedOnly: !showResolved },
       });
-      return Array.isArray(res.data) ? res.data : [];
+      const list = Array.isArray(res.data) ? res.data : [];
+      return deduplicateExpiryAlerts(list);
     },
     refetchInterval: 30000,
   });
 
+  const alerts = useMemo(() => {
+    const deduplicated = deduplicateExpiryAlerts(rawAlerts, resolvedAlertsMap);
+    if (showResolved) {
+      return deduplicated;
+    }
+    return deduplicated.filter((item) => {
+      if (!item.isResolved) return true;
+      const batchKey = String(item.idProdBatch || item.idAlert || '').trim();
+      return Boolean(
+        (batchKey && sessionResolvedBatchKeys[batchKey]) ||
+          (item.idAlert && sessionResolvedBatchKeys[item.idAlert])
+      );
+    });
+  }, [rawAlerts, resolvedAlertsMap, showResolved, sessionResolvedBatchKeys]);
+
+  const handleToggleShowResolved = (checked: boolean) => {
+    setResolvedAlertsMap((prev) => {
+      const next = { ...prev };
+      rawAlerts.forEach((item) => {
+        if (item.isResolved) {
+          const batchKey = String(
+            item.idProdBatch || item.idAlert || ''
+          ).trim();
+          if (batchKey) {
+            next[batchKey] = { ...item, isResolved: true };
+          }
+        }
+      });
+      return next;
+    });
+
+    if (!checked) {
+      setSessionResolvedBatchKeys({});
+    }
+    setShowResolved(checked);
+  };
+
   const resolveMutation = useMutation({
-    mutationFn: async (idAlert: string) => {
-      await api.patch(`/api/inventory/alerts/${idAlert}/resolve`);
+    mutationFn: async (alertItem: ExpiryAlertItem) => {
+      await api.patch(`/api/inventory/alerts/${alertItem.idAlert}/resolve`);
+
+      const duplicateUnresolved = rawAlerts.filter(
+        (a) =>
+          a.idProdBatch === alertItem.idProdBatch &&
+          a.idAlert !== alertItem.idAlert &&
+          !a.isResolved
+      );
+      if (duplicateUnresolved.length > 0) {
+        await Promise.all(
+          duplicateUnresolved.map((dup) =>
+            api
+              .patch(`/api/inventory/alerts/${dup.idAlert}/resolve`)
+              .catch(() => null)
+          )
+        );
+      }
+
+      return alertItem;
     },
-    onSuccess: () => {
+    onSuccess: (alertItem) => {
       setActionError(null);
+      const resolvedItem: ExpiryAlertItem = {
+        ...alertItem,
+        isResolved: true,
+      };
+      const batchKey = String(
+        alertItem.idProdBatch || alertItem.idAlert || ''
+      ).trim();
+
+      setResolvedAlertsMap((prev) => ({
+        ...prev,
+        ...(batchKey ? { [batchKey]: resolvedItem } : {}),
+      }));
+
+      setSessionResolvedBatchKeys((prev) => ({
+        ...prev,
+        ...(batchKey ? { [batchKey]: true } : {}),
+        ...(alertItem.idAlert ? { [alertItem.idAlert]: true } : {}),
+      }));
+
+      queryClient.setQueriesData<ExpiryAlertItem[]>(
+        { queryKey: ['admin-expiry-alerts'] },
+        (oldData) => {
+          if (!Array.isArray(oldData)) return oldData;
+          const updated = oldData.map((item) =>
+            item.idAlert === alertItem.idAlert ||
+            item.idProdBatch === alertItem.idProdBatch
+              ? { ...item, isResolved: true }
+              : item
+          );
+          return deduplicateExpiryAlerts(
+            updated,
+            batchKey ? { [batchKey]: resolvedItem } : {}
+          );
+        }
+      );
+
       queryClient.invalidateQueries({ queryKey: ['admin-expiry-alerts'] });
     },
     onError: (err) => {
@@ -110,7 +263,7 @@ export default function ExpiryAlertPanel() {
             <input
               type="checkbox"
               checked={showResolved}
-              onChange={(e) => setShowResolved(e.target.checked)}
+              onChange={(e) => handleToggleShowResolved(e.target.checked)}
               className="w-3.5 h-3.5 rounded accent-[#4737FF]"
             />
             <span>Tampilkan yang Selesai</span>
@@ -186,9 +339,11 @@ export default function ExpiryAlertPanel() {
                   ? Math.round((alert.hargaEceran * (100 - alert.diskon)) / 100)
                   : alert.hargaEceran;
 
+            const uniqueAlertKey = `${alert.idProdBatch}-${alert.idAlert}`;
+
             return (
               <div
-                key={alert.idAlert}
+                key={uniqueAlertKey}
                 className={`p-3.5 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition-all ${
                   alert.isResolved
                     ? 'bg-slate-50 border-slate-200 opacity-65'
@@ -267,7 +422,7 @@ export default function ExpiryAlertPanel() {
                     <button
                       type="button"
                       disabled={resolveMutation.isPending}
-                      onClick={() => resolveMutation.mutate(alert.idAlert)}
+                      onClick={() => resolveMutation.mutate(alert)}
                       className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#159A68] hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold transition-colors cursor-pointer"
                     >
                       <CheckCircle2 className="w-3.5 h-3.5" />
@@ -275,7 +430,7 @@ export default function ExpiryAlertPanel() {
                     </button>
                   ) : (
                     <span className="px-2.5 py-1 rounded-lg bg-emerald-50 text-[#159A68] text-[11px] font-bold">
-                      Selesai
+                      Selesai Ditangani
                     </span>
                   )}
                 </div>

@@ -31,7 +31,10 @@ const registerSchema = z.object({
   nama: z.string().min(2, 'Nama lengkap minimal 2 karakter'),
   email: z.string().email('Format email tidak valid'),
   password: z.string().min(6, 'Kata sandi minimal 6 karakter'),
-  noTelp: z.string().min(8, 'Nomor telepon minimal 8 digit'),
+  noTelp: z
+    .string()
+    .min(10, 'Nomor telepon tidak valid, minimal 10 digit.')
+    .max(13, 'Nomor telepon maksimal 13 digit.'),
   alamat: z.string().min(5, 'Alamat lengkap minimal 5 karakter'),
   tipeAkun: z.enum(['B2C', 'B2B']),
 });
@@ -49,6 +52,8 @@ export default function RegisterPage() {
     handleSubmit,
     watch,
     setValue,
+    setError,
+    clearErrors,
     formState: { errors, isSubmitting },
   } = useForm<RegisterFormValues>({
     resolver: zodResolver(registerSchema),
@@ -63,6 +68,49 @@ export default function RegisterPage() {
   });
 
   const selectedTipeAkun = watch('tipeAkun');
+  const noTelpRegister = register('noTelp');
+
+  const handlePhoneChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    let value = e.target.value.replace(/\D/g, '');
+
+    if (value.startsWith('628')) {
+      value = '08' + value.slice(3);
+    } else if (value === '6' || value === '62') {
+      // Izinkan transisi saat mengetik awalan 628
+    } else if (value.length > 0 && !value.startsWith('0')) {
+      value = '08' + (value.startsWith('8') ? value.slice(1) : '');
+    } else if (value.length >= 2 && !value.startsWith('08')) {
+      value = '08' + value.slice(2);
+    }
+
+    value = value.slice(0, 13);
+    e.target.value = value;
+    setValue('noTelp', value, { shouldDirty: true });
+
+    if (value.length === 0 || value.length >= 10) {
+      clearErrors('noTelp');
+    }
+  };
+
+  const handlePhoneBlur = (e: React.FocusEvent<HTMLInputElement>) => {
+    noTelpRegister.onBlur(e);
+    let value = e.target.value.replace(/\D/g, '');
+
+    if (value === '6' || value === '62') {
+      value = '08';
+      e.target.value = value;
+      setValue('noTelp', value, { shouldDirty: true });
+    }
+
+    if (value.length > 0 && value.length < 10) {
+      setError('noTelp', {
+        type: 'manual',
+        message: 'Nomor telepon tidak valid, minimal 10 digit.',
+      });
+    } else if (value.length === 0 || (value.length >= 10 && value.length <= 13)) {
+      clearErrors('noTelp');
+    }
+  };
 
   const onSubmit = async (values: RegisterFormValues) => {
     setServerError(null);
@@ -300,8 +348,12 @@ export default function RegisterPage() {
                   <input
                     id="noTelp"
                     type="tel"
+                    inputMode="numeric"
+                    maxLength={13}
                     placeholder="081234567890"
-                    {...register('noTelp')}
+                    {...noTelpRegister}
+                    onChange={handlePhoneChange}
+                    onBlur={handlePhoneBlur}
                     className="w-full rounded-xl border border-[#E6E8F0] bg-[#F8FAFF] focus:bg-white pl-10 pr-3.5 py-2.5 text-xs text-[#171725] focus:border-[#4737FF] focus:outline-none"
                   />
                 </div>

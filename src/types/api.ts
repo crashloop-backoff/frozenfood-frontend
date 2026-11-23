@@ -48,6 +48,8 @@ export interface ProductCatalogResponse {
   deskripsiProduk: string;
   kategori: string;
   hargaEceran: number;
+  hargaBeli?: number | null;
+  keuntungan?: number | null;
   berat: number;
   volume: number;
   gambar: string | null;
@@ -138,6 +140,7 @@ export interface ProductUpsertRequest {
   deskripsiProduk?: string;
   kategori: string;
   hargaEceran: number;
+  hargaBeli: number;
   berat: number;
   volume?: number;
   gambar?: string | null;
